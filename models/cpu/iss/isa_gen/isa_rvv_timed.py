@@ -287,6 +287,20 @@ Format_OPVL = [ OutReg     (0, Range(7 , 5)),
                 InReg      (1, Range(20, 5)),
 ]
 
+Format_DIMC = [
+    OutVReg     (0, Range(7 , 5)),
+    InVReg      (0, Range(15, 5)),
+    UnsignedImm (0, Range(20, 12)),
+]
+
+Format_DIMC_sqacc = [
+    OutVReg      (0, Range(7, 5)),
+    InVReg       (0, Range(15, 5)),
+    UnsignedImm  (0, Range(20, 3)),
+    UnsignedImm  (1, Range(23, 2)),
+    UnsignedImm  (2, Range(25, 1)),
+]
+
 class Rv32v(IsaSubset):
 
     def __init__(self):
@@ -541,6 +555,7 @@ class Rv32v(IsaSubset):
 
             Instr('vfslide1down.vf' , VF_VFFU, '001111 - ----- ----- 101 ----- 1010111', tags=['fp_op', 'nseq']),
             Instr('vfslide1up.vf'   , VF_VFFU, '001110 - ----- ----- 101 ----- 1010111', tags=['fp_op', 'nseq']),
+            Instr('sf_vqmmacc'      , Format_DIMC_sqacc, '101110 - ----- ----- 000 ----- 1110111'),
 
 
 

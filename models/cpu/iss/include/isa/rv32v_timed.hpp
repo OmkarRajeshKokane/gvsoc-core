@@ -2328,6 +2328,48 @@ static inline iss_reg_t vfslide1up_vf_exec(Iss *iss, iss_insn_t *insn, iss_reg_t
     return iss_insn_next(iss, insn, pc);
 }
 
+static inline iss_reg_t sf_vqmmacc_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
+{
+    unsigned int sewb = iss->vector.sewb;
+    unsigned int lmul = iss->vector.lmul;
+    const int vd_reg = REG_OUT(0);
+    const int vs1_reg = REG_IN(0);
+    const int ci = UIM_GET(0);
+    const int vs2_reg = UIM_GET(1) * 8;
+
+    unsigned int max_vl = iss->csr.vl.value;
+
+    for (unsigned int i = iss->csr.vstart.value; i < max_vl; i++)
+    {
+        iss->dimc.FB[i] = velem_get_value(iss, vs1_reg, i, sewb, lmul);
+    }
+    iss->dimc.move_FB();
+
+    for (unsigned int j = vs2_reg; j < (vs2_reg + 8); j++)
+    {
+        for (unsigned int i = iss->csr.vstart.value; i < max_vl; i++)
+        {
+            iss->dimc.KB[j][i] = velem_get_value(iss, j, i, sewb, lmul);
+        }
+        iss->dimc.move_KB();
+    }
+
+    iss->dimc.Ci = ci;
+    for (unsigned int j = vs2_reg; j < (vs2_reg + 8); j++)
+    {
+        iss->dimc.row_sel = j;
+        iss->dimc.compute_PP();
+    }
+
+    int shift = (ci > 3) ? 8 : 0;
+    for (int j = 0; j < 8; j++)
+    {
+        velem_set_value(iss, vd_reg, j + shift, 4, iss->dimc.OP_buffer[j]);
+    }
+
+    return iss_insn_next(iss, insn, pc);
+}
+
 static inline iss_reg_t vfdiv_vf_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
     unsigned int sewb = iss->vector.sewb;

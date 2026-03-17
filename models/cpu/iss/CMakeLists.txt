@@ -48,6 +48,7 @@ function(generate_isa)
         "${F_GVSOC_ISS_DIR}/flexfloat/flexfloat.c"
         "${F_GVSOC_ISS_DIR}/src/spatz.cpp"
         "${F_GVSOC_ISS_DIR}/src/ssr.cpp"
+        "${F_GVSOC_ISS_DIR}/src/dimc.cpp"
         )
 
     if (NOT DEFINED GEN_ISA_IRQ)
@@ -82,4 +83,3 @@ function(generate_isa)
     vp_model_compile_options(NAME ${GEN_ISA_NAME} OPTIONS "-fno-strict-aliasing")
 
 endfunction()
-
