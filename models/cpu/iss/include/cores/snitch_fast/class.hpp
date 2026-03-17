@@ -36,6 +36,7 @@
 #ifdef CONFIG_ISS_VLEN
 #include <cpu/iss/include/vector.hpp>
 #endif
+#include <cpu/iss/include/isa/dimc.hpp>
 #include <cpu/iss/include/cores/snitch_fast/regfile.hpp>
 #ifdef CONFIG_GVSOC_ISS_RISCV_EXCEPTIONS
 #include <cpu/iss/include/irq/irq_riscv.hpp>
@@ -96,6 +97,7 @@ public:
     Memcheck memcheck;
 #if defined(CONFIG_GVSOC_ISS_USE_SPATZ)
     Vector vector;
+    DIMC dimc;
     Ara vu;
 #endif
 

@@ -36,7 +36,7 @@ Iss::Iss(IssWrapper &top)
       , ssr(top, *this)
 #endif
 #if defined(CONFIG_GVSOC_ISS_USE_SPATZ)
-      , vector(*this), vu(top, *this)
+      , vector(*this), dimc(*this), vu(top, *this)
 #endif
 {
     this->csr.declare_csr(&this->csr_fmode, "fmode", 0x800);
