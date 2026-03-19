@@ -21,7 +21,7 @@
 #include "cpu/iss_v2/include/iss.hpp"
 
 Spatz::Spatz(Iss &iss)
-: iss(iss), vu(iss)
+: iss(iss), vu(iss), dimc(iss)
 {
 }
 

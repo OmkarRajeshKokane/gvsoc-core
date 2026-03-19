@@ -25,6 +25,7 @@
 #include <cpu/iss_v2/include/csr.hpp>
 #include <cpu/iss_v2/include/vector.hpp>
 #include <cpu/iss_v2/include/cores/vector_unit/vector_unit.hpp>
+#include <cpu/iss_v2/include/cores/spatz/dimc.hpp>
 
 class Iss;
 
@@ -38,6 +39,7 @@ public:
     void reset(bool active);
 
     Vu vu;
+    DIMC dimc;
 
 private:
 
