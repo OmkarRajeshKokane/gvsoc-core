@@ -2341,30 +2341,30 @@ static inline iss_reg_t sf_vqmmacc_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc
 
     for (unsigned int i = iss->csr.vstart.value; i < max_vl; i++)
     {
-        iss->dimc.FB[i] = velem_get_value(iss, vs1_reg, i, sewb, lmul);
+        iss->arch.dimc.FB[i] = velem_get_value(iss, vs1_reg, i, sewb, lmul);
     }
-    iss->dimc.move_FB();
+    iss->arch.dimc.move_FB();
 
     for (unsigned int j = vs2_reg; j < (vs2_reg + 8); j++)
     {
         for (unsigned int i = iss->csr.vstart.value; i < max_vl; i++)
         {
-            iss->dimc.KB[j][i] = velem_get_value(iss, j, i, sewb, lmul);
+            iss->arch.dimc.KB[j][i] = velem_get_value(iss, j, i, sewb, lmul);
         }
-        iss->dimc.move_KB();
+        iss->arch.dimc.move_KB();
     }
 
-    iss->dimc.Ci = ci;
+    iss->arch.dimc.Ci = ci;
     for (unsigned int j = vs2_reg; j < (vs2_reg + 8); j++)
     {
-        iss->dimc.row_sel = j;
-        iss->dimc.compute_PP();
+        iss->arch.dimc.row_sel = j;
+        iss->arch.dimc.compute_PP();
     }
 
     int shift = (ci > 3) ? 8 : 0;
     for (int j = 0; j < 8; j++)
     {
-        velem_set_value(iss, vd_reg, j + shift, 4, iss->dimc.OP_buffer[j]);
+        velem_set_value(iss, vd_reg, j + shift, 4, iss->arch.dimc.OP_buffer[j]);
     }
 
     return iss_insn_next(iss, insn, pc);
