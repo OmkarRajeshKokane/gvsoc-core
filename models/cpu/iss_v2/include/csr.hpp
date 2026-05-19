@@ -246,6 +246,8 @@ public:
     CsrReg vl;
     CsrReg vtype;
     CsrReg vlenb;
+    CsrReg dimc_kernel;
+    CsrReg dimc_feature_reuse;
 
 #if defined(CONFIG_GVSOC_ISS_RI5KY) || defined(CONFIG_GVSOC_ISS_HWLOOP)
     iss_reg_t hwloop_regs[HWLOOP_NB_REGS];
