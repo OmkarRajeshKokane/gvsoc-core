@@ -42,6 +42,9 @@
 #define CSR_STACK_END    0x7D2
 #endif
 
+#define CSR_DIMC_KERNEL         0x7D3
+#define CSR_DIMC_FEATURE_REUSE  0x7D4
+
 #define CSR_MESTATUS_INTEN_BIT 0
 #define CSR_MESTATUS_PRV_BIT   1
 

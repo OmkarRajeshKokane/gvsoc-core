@@ -246,6 +246,8 @@ public:
     CsrReg vl;
     CsrReg vtype;
     CsrReg vlenb;
+    CsrReg dimc_kernel;
+    CsrReg dimc_feature_reuse;
 
     // Hwloop CSR storage now lives in the Hwloop module (see
     // include/hwloop/hwloop.hpp). The LPSTART / LPEND / LPCOUNT

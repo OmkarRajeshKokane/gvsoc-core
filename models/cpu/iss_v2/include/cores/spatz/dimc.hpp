@@ -35,6 +35,12 @@ public:
     int kmc_block_count=0;
     int fmc_block_count=0;
 
+    bool Kernel_load = 0; 
+    int Move_delay = 0; 
+    bool Feature_reuse = 0;
+    bool Feature_load_flag=0;    
+
+    int instrucn_call=0;
     int row_sel=0;
     bool burst_mode_compute=0;
     //bool FLC [FB_EW/VRF_size]; // Feature load Filled/ Complete

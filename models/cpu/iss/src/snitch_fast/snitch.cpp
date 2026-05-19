@@ -41,6 +41,7 @@ Iss::Iss(IssWrapper &top)
 {
     this->csr.declare_csr(&this->csr_fmode, "fmode", 0x800);
     this->csr.declare_csr(&this->barrier,  "barrier",   0x7C2);
+    this->csr.declare_csr(&this->csr_dimc_ctrl, "dimc_ctrl", 0x7C3); // custom CSR
     this->barrier.register_callback(std::bind(&Iss::barrier_update, this, std::placeholders::_1,
         std::placeholders::_2));
 

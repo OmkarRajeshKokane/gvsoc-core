@@ -20,6 +20,7 @@
 
 #include "cpu/iss_v2/include/iss.hpp"
 #include "cpu/iss_v2/include/cores/vector_unit/vector_unit.hpp"
+#include <cstring>
 
 VuCompute::VuCompute(Vu &vu, std::string name)
 : VuBlock(&vu, name), vu(vu),
@@ -130,9 +131,22 @@ void VuCompute::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 
             if (pending_insn->nb_bytes_done >= _this->total_size)
             {
+                int extra_latency = 0;
+                const char *label = insn->desc->label;
+                bool is_dimc_insn =
+                    std::strcmp(label, "sf_vqmmacc") == 0 ||
+                    std::strcmp(label, "sf.vqmmacc") == 0 ||
+                    std::strcmp(label, "sf_vqmmacc16") == 0 ||
+                    std::strcmp(label, "sf.vqmmacc16") == 0;
+                if (is_dimc_insn)
+                {
+                    extra_latency = _this->vu.iss.arch.dimc.Move_delay;
+                    
+                }
+
                 _this->pending_insn = pending_insn;
                	_this->insns.pop();
-                _this->pending_insn->timestamp = _this->vu.iss.clock.get_cycles() + insn->latency + 1;
+                _this->pending_insn->timestamp = _this->vu.iss.clock.get_cycles() + extra_latency - 1;
             }
 
         }
