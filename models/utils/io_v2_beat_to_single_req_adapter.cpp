@@ -442,7 +442,7 @@ void IoV2BeatToSingleReqAdapter::complete_read_beat(vp::IoReq *req,
     if (this->read_last_sched_cycle < now)
         this->read_last_sched_cycle = now;
 
-    int64_t ready = now + std::max((int64_t)1, latency_cycles);
+    int64_t ready = now + std::max((int64_t)1, latency_cycles) + this->cfg.read_latency;
     if (ready <= this->read_last_sched_cycle)
         ready = this->read_last_sched_cycle + 1;
     this->read_last_sched_cycle = ready;
@@ -576,6 +576,9 @@ void IoV2BeatToSingleReqAdapter::schedule_chunk(vp::IoReq *req, uint64_t size,
     int64_t now = this->clock.get_cycles();
     int n = (int)((size + this->beat_width - 1) / this->beat_width);
     if (n <= 0) n = 1;
+
+    // Pipeline delay of the bridge on the write response path.
+    latency_cycles += this->cfg.write_latency;
 
     // Bandwidth model: the slave's latency annotation is the time-to-completion of
     // the whole chunk. step is the per-beat slave time so the LAST entry lands at
@@ -820,7 +823,7 @@ void IoV2BeatToSingleReqAdapter::fsm_handler(vp::Block *__this, vp::ClockEvent *
 // (Re)arm fsm_event for the earliest future work: the soonest due read/write beat
 // and/or the next cycle if a sub-read can still be issued. Called at the end of
 // every state-changing method. A no-op while back-pressured (resp_held) — the
-// resp_retry path will re-arm — or if the event is already enqueued.
+// resp_retry path will re-arm.
 void IoV2BeatToSingleReqAdapter::reschedule_fsm()
 {
     // Blocked on upstream back-pressure: nothing can drain until resp_retry
@@ -829,10 +832,9 @@ void IoV2BeatToSingleReqAdapter::reschedule_fsm()
     {
         return;
     }
-    if (this->fsm_event.is_enqueued())
-    {
-        return;
-    }
+    // No is_enqueued() guard: the event may be waiting for a response due in a
+    // few cycles while a sub-read wants the next one. enqueue() keeps the
+    // earliest of the two.
     int64_t now = this->clock.get_cycles();
     int64_t next = INT64_MAX;
     if (!this->read_pending.empty())

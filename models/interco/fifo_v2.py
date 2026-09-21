@@ -34,6 +34,18 @@ class FifoConfig(Config):
     latency : int
         Cycles between a request being accepted upstream and being driven
         downstream (the FIFO's register stage). Minimum 1.
+    resp_latency : int
+        Cycles between the downstream response and the response being sent
+        upstream (the response registers). The request keeps its slot
+        meanwhile. 0 sends it in the same cycle.
+    done_latency : int
+        Cycles added to ``resp_latency`` when the downstream completes the
+        request inline (a synchronous target, which gives its response the
+        cycle after it is granted on a real bus). 0 by default.
+    max_outstanding : int
+        Number of requests which can be waiting for their downstream response
+        at the same time. With 1, a request only goes downstream once the
+        previous one has been answered.
     """
 
     depth:   int = cfg_field(default=2, dump=True, desc=(
@@ -41,6 +53,15 @@ class FifoConfig(Config):
     ))
     latency: int = cfg_field(default=1, dump=True, desc=(
         "Cycles between accepting a request upstream and issuing it downstream"
+    ))
+    resp_latency: int = cfg_field(default=0, dump=True, desc=(
+        "Cycles between the downstream response and the response sent upstream"
+    ))
+    done_latency: int = cfg_field(default=0, dump=True, desc=(
+        "Cycles added to the response latency when the downstream completes the request inline"
+    ))
+    max_outstanding: int = cfg_field(default=1, dump=True, desc=(
+        "Number of requests which can be waiting for their downstream response"
     ))
 
 

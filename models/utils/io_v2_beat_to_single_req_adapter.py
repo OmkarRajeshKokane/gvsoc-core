@@ -46,14 +46,24 @@ class IoV2BeatToSingleReqAdapterConfig(Config):
         "delivered upstream). The read request channel is back-pressured beyond "
         "this — the HW r_id-FIFO analogue."
     ))
+    read_latency: int = cfg_field(default=0, dump=True, desc=(
+        "Cycles added to every read response beat, on top of the latency reported by the "
+        "downstream. It is a pipeline delay: it shifts the response stream without "
+        "limiting how many accesses are in flight."
+    ))
+    write_latency: int = cfg_field(default=0, dump=True, desc=(
+        "Cycles added to every write acknowledgement, on top of the latency reported by "
+        "the downstream. It is a pipeline delay, like read_latency."
+    ))
 
 
 class IoV2BeatToSingleReqAdapter(Component):
 
     def __init__(self, parent: Component, name: str, beat_width: int,
-                 max_read_bursts: int = 4):
+                 max_read_bursts: int = 4, read_latency: int = 0, write_latency: int = 0):
         super().__init__(parent, name, config=IoV2BeatToSingleReqAdapterConfig(
-            beat_width=beat_width, max_read_bursts=max_read_bursts))
+            beat_width=beat_width, max_read_bursts=max_read_bursts,
+            read_latency=read_latency, write_latency=write_latency))
         self.set_component('utils.io_v2_beat_to_single_req_adapter')
         self._beat_width = beat_width
 
