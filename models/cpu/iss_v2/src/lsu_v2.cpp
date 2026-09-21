@@ -23,6 +23,8 @@ LsuV2::LsuV2(Iss &iss)
       io_req_denied(iss, "lsu/req_denied", 1)
 {
     iss.traces.new_trace("lsu", &this->trace, vp::DEBUG);
+
+    this->hold_on_async = iss.cfg.lsu_hold_on_async;
     // data's retry/resp callbacks are passed via the in-class initializer
     // of the IoMaster member; no set_retry_meth/set_resp_meth needed in v2.
     this->iss.new_master_port("data", &this->data, (vp::Block *)this);
@@ -36,6 +38,7 @@ LsuV2::LsuV2(Iss &iss)
         req->req.set_second_data((uint8_t *)&req->data2);
         req->misaligned_size = 0;
         req->misaligned_byte_offset = 0;
+        req->holds_core = false;
         this->req_entry_first = req;
         req->task.callback = &LsuV2::task_handle;
     }
@@ -48,6 +51,11 @@ void LsuV2::reset(bool active)
         this->io_req_denied = false;
         this->denied_entry = NULL;
         this->granted_entry = NULL;
+        // The retain count of the core is reset with it
+        for (int i = 0; i < CONFIG_GVSOC_ISS_LSU_NB_OUTSTANDING; i++)
+        {
+            this->req_entry[i].holds_core = false;
+        }
         this->pending_fence = false;
         this->nb_pending_accesses = 0;
         this->next_retire_cycle = 0;
@@ -165,7 +173,31 @@ void LsuV2::data_retry(vp::Block *__this, vp::IoRetryChannel)
         entry->timestamp = _this->iss.clock.get_cycles() + entry->req.get_latency();
         _this->iss.exec.enqueue_task(&entry->task);
     }
-    // GRANTED: data_response will complete the parked instruction.
+    else
+    {
+        // GRANTED: data_response will complete the parked instruction.
+        _this->hold_core(entry);
+    }
+}
+
+
+void LsuV2::hold_core(LsuReqEntry *entry)
+{
+    if (this->hold_on_async && !entry->holds_core)
+    {
+        entry->holds_core = true;
+        this->iss.exec.retain_inc();
+    }
+}
+
+
+void LsuV2::release_core(LsuReqEntry *entry)
+{
+    if (entry->holds_core)
+    {
+        entry->holds_core = false;
+        this->iss.exec.retain_dec();
+    }
 }
 
 vp::IoRespAck LsuV2::data_response(vp::Block *__this, vp::IoReq *req)
@@ -208,7 +240,8 @@ vp::IoRespAck LsuV2::data_response(vp::Block *__this, vp::IoReq *req)
     // also clear the bits the same cycle. Applies to any core wired
     // with a scoreboard, not just those opting into in-order commit.
     iss_insn_t *insn = _this->iss.exec.get_insn(insn_entry);
-    _this->iss.exec.schedule_scoreboard_release(insn->sb_out_reg_mask);
+    _this->iss.exec.schedule_scoreboard_release(insn->sb_out_reg_mask,
+        _this->async_load_use_delay());
     _this->iss.exec.insn_terminate(insn_entry, /*defer_scoreboard_release=*/true);
 #else
     _this->iss.exec.insn_terminate(insn_entry);
@@ -320,6 +353,7 @@ void LsuV2::handle_req_end(LsuReqEntry *entry)
     // Clear the misaligned scratch on the way back to the free list so
     // a future aligned access doesn't see stale state.
     entry->misaligned_byte_offset = 0;
+    this->release_core(entry);
     this->free_req_entry(entry);
 }
 
@@ -412,6 +446,7 @@ bool LsuV2::data_req_aligned(iss_insn_t *insn, iss_addr_t addr, int size,
         // the completion.
         entry->insn_entry = this->iss.exec.insn_hold(insn);
         this->granted_entry = entry;
+        this->hold_core(entry);
         return false;
     }
     else
@@ -639,6 +674,8 @@ void LsuV2::task_handle(Iss *iss, Task *task)
     // livelocking the core until an unrelated event happens to break the tie.
 
     InsnEntry *insn_entry = entry->insn_entry;
+    // handle_req_end releases the core, remember if this access was holding it
+    bool held_core = entry->holds_core;
     iss->lsu.req_retire_hook(entry);
     iss->lsu.handle_req_end(entry);
 #ifdef CONFIG_GVSOC_ISS_REGFILE_SCOREBOARD
@@ -647,7 +684,8 @@ void LsuV2::task_handle(Iss *iss, Task *task)
     // `insn_terminate` to leave the scoreboard alone so the parked
     // mask fires one cycle from now.
     iss_insn_t *insn = iss->exec.get_insn(insn_entry);
-    iss->exec.schedule_scoreboard_release(insn->sb_out_reg_mask);
+    iss->exec.schedule_scoreboard_release(insn->sb_out_reg_mask,
+        held_core ? iss->lsu.async_load_use_delay() : 1);
     iss->exec.insn_terminate(insn_entry, /*defer_scoreboard_release=*/true);
 #else
     iss->exec.insn_terminate(insn_entry);

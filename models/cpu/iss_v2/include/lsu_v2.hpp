@@ -69,6 +69,9 @@ struct LsuReqEntry
     iss_addr_t misaligned_addr;
     int        misaligned_byte_offset;
 
+    // True while this access retains the core (see LsuV2::hold_on_async).
+    bool holds_core;
+
     // Memcheck shadow of the transferred data (per-byte validity of ``data``)
     uint8_t  memcheck_data[8];
 };
@@ -214,6 +217,21 @@ protected:
     // live-locks.
     LsuReqEntry *denied_entry;
     bool pending_fence;
+
+    // Optional behaviour, off by default, enabled with the core configuration
+    // field ``lsu_hold_on_async``. Some cores are only granted a data access when
+    // its response is about to come back (RI5CY behind the PULP cluster core
+    // demux, for anything which is not the TCDM), so they cannot execute
+    // anything during the access, load or store alike. When set, an access
+    // answered asynchronously retains the core until its response is back.
+    bool hold_on_async = false;
+    // With the core held, the response stands for the grant of the access:
+    // the core resumes on the next cycle, but the data of a load only comes
+    // one cycle after the grant, so a dependent instruction waits one more.
+    int async_load_use_delay() { return this->hold_on_async ? 2 : 1; }
+    // Retain the core for this access, and release it.
+    void hold_core(LsuReqEntry *entry);
+    void release_core(LsuReqEntry *entry);
     // True while data_req_misaligned drives data_req_aligned for beat 0, so the
     // memcheck preparation knows not to attach a data shadow
     bool issuing_misaligned;

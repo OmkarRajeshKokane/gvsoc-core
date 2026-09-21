@@ -114,7 +114,9 @@ public:
     // load's dest is valid the cycle after the response arrives).
     // Available to any core wired with a scoreboard, regardless of
     // whether it opts into the in-order-commit trace mechanism.
-    void schedule_scoreboard_release(uint64_t mask);
+    // ``delay`` is the number of cycles after which the registers become
+    // readable (1 = the usual load-use stall).
+    void schedule_scoreboard_release(uint64_t mask, int delay=1);
 private:
     static void task_unblock_handle(Iss *iss, Task *task);
 public:

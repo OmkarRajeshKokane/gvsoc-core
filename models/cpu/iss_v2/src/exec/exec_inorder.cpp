@@ -442,7 +442,7 @@ void ExecInOrder::drain_entry(InsnEntry *entry)
 #endif
 
 #ifdef CONFIG_GVSOC_ISS_REGFILE_SCOREBOARD
-void ExecInOrder::schedule_scoreboard_release(uint64_t mask)
+void ExecInOrder::schedule_scoreboard_release(uint64_t mask, int delay)
 {
     if (mask == 0) return;
 
@@ -460,7 +460,7 @@ void ExecInOrder::schedule_scoreboard_release(uint64_t mask)
     // response writes all its destinations in the same cycle, so
     // their scoreboard bits all clear together one cycle later.
     this->unblock_slot_mask = mask;
-    this->unblock_slot_timestamp = this->iss.clock.get_cycles() + 1;
+    this->unblock_slot_timestamp = this->iss.clock.get_cycles() + delay;
     this->unblock_slot_valid = true;
     if (!this->unblock_task_pending)
     {
