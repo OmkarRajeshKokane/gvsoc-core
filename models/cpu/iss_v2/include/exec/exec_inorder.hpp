@@ -95,6 +95,9 @@ public:
 
     iss_insn_t *get_insn(InsnEntry *entry);
     inline void insn_stall() { this->is_insn_stalled = true; }
+    // True if the instruction being executed has just stalled (data access not
+    // accepted): it is retried on the next cycle.
+    inline bool insn_is_stalled() { return this->is_insn_stalled; }
     InsnEntry *insn_hold(iss_insn_t *insn);
     // `defer_scoreboard_release=true` skips the immediate
     // `scoreboard_insn_end` at commit. Used by `LsuV2` when paired

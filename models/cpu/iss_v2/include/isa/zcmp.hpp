@@ -118,14 +118,30 @@ static inline iss_reg_t cm_insn_handle(Iss *iss, iss_insn_t *insn, iss_reg_t pc,
         iss->insn_cache.register_insn_table(table);
     }
 
+    int index = iss->exec.insn_table_index;
+
     // The stack pointer update and everything after it must not be interrupted.
-    if (iss->exec.insn_table_index == nb_regs)
+    if (index == nb_regs)
     {
         iss->exec.irq_locked++;
     }
 
-    iss_insn_t *current = &table[iss->exec.insn_table_index++];
+    iss_insn_t *current = &table[index];
     iss_reg_t next = current->handler(iss, current, pc);
+
+    if (iss->exec.insn_is_stalled())
+    {
+        // The micro-instruction did not execute (its data access is stalled):
+        // the macro-instruction is retried on the next cycle and must resume
+        // on this same micro-instruction, not on the next one.
+        if (index == nb_regs)
+        {
+            iss->exec.irq_locked--;
+        }
+        return pc;
+    }
+
+    iss->exec.insn_table_index = index + 1;
 
     // Report the macro-instruction's own pc until its last micro-instruction.
     if (iss->exec.insn_table_index == nb_insns)
