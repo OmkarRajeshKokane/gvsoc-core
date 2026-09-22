@@ -78,6 +78,11 @@ class CacheConfig(Config):
         "through the refill port when it is otherwise idle, hiding the "
         "refill latency of streaming code (RTL snitch_icache prefetcher)"
     ))
+    refill_free_way_first: bool = cfg_field(default=False, dump=True, desc=(
+        "True if a refill goes to a free way of the set when there is one, and only "
+        "evicts a pseudo-random way once every way is valid (the PULP caches). False "
+        "(default) always picks a pseudo-random way."
+    ))
 
 
 class Cache(Component):

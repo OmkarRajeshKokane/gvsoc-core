@@ -94,6 +94,7 @@ private:
                             unsigned int *tag, unsigned int *line_offset);
 
     unsigned int step_lru();
+    unsigned int get_refill_way(unsigned int line_index);
     void enable(bool e);
     void flush();
     void flush_line_op(unsigned int addr);
@@ -466,7 +467,7 @@ void Cache::try_prefetch()
         }
     }
 
-    unsigned int way = this->step_lru() % this->cfg.ways;
+    unsigned int way = this->get_refill_way(line_index);
     cache_line_t *line = &this->lines[line_index * this->cfg.ways + way];
 
     uint32_t full_addr = ((addr & ~((1U << this->line_size_bits) - 1))
@@ -540,7 +541,7 @@ cache_line_t *Cache::refill(int line_index, unsigned int addr, unsigned int tag,
         return nullptr;
     }
 
-    unsigned int refill_way = this->step_lru() % this->cfg.ways;
+    unsigned int refill_way = this->get_refill_way(line_index);
     cache_line_t *line = &this->lines[line_index * this->cfg.ways + refill_way];
 
     uint32_t full_addr = ((addr & ~((1U << this->line_size_bits) - 1))
@@ -818,6 +819,29 @@ vp::IoReqStatus Cache::input_req(vp::Block *__this, vp::IoReq *req)
 // ---------------------------------------------------------------------------
 // Pseudo-random LRU (8-bit LFSR, matches cache_v3)
 // ---------------------------------------------------------------------------
+
+// Way to refill in a set. With refill_free_way_first, the first free one if
+// there is one, like the PULP caches, which only draw a random victim once
+// all the ways of the set are valid; the LFSR is then only stepped in that
+// case, as in the hardware.
+unsigned int Cache::get_refill_way(unsigned int line_index)
+{
+    if (this->cfg.refill_free_way_first)
+    {
+        for (unsigned int i = 0; i < this->cfg.ways; i++)
+        {
+            cache_line_t *line = &this->lines[line_index * this->cfg.ways + i];
+            // A line being refilled asynchronously is only tagged when its
+            // data is back: it is not free.
+            if (line->tag == (uint32_t)-1 &&
+                !(this->pending_refill.get() && line == this->refill_line))
+            {
+                return i;
+            }
+        }
+    }
+    return this->step_lru() % this->cfg.ways;
+}
 
 unsigned int Cache::step_lru()
 {
