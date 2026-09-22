@@ -76,6 +76,8 @@ void IoV2ClockBridge::reset(bool active)
         if (this->resp_event->is_enqueued())
             this->master_engine->cancel(this->resp_event);
         this->resp_queue.clear();
+        this->resp_held = false;
+        this->resp_retry_owed = false;
         return;
     }
 
@@ -251,14 +253,16 @@ vp::IoRespAck IoV2ClockBridge::out_resp_handler(vp::Block *__this, vp::IoReq *re
 
     if (!self->parametric)
     {
+        self->master_engine->sync();
+
         // The resp lands here on a slave (SoC) clock edge. Re-synchronize it
         // onto the master (cluster) clock by delivering on the master's next
         // edge: enqueue() on the idle master engine aligns the wake-up to the
-        // next cluster edge at/after the current time, as a CDC synchronizer
+        // next cluster edge after the current time, as a CDC synchronizer
         // would sample the response. Delivering inline instead would leak the
         // SoC edge timing into the cluster.
         self->resp_queue.push_back(req);
-        if (!self->resp_event->is_enqueued())
+        if (!self->resp_held && !self->resp_event->is_enqueued())
             self->master_engine->enqueue(self->resp_event, 1);
         return vp::IO_RESP_ACCEPTED;
     }
@@ -296,11 +300,51 @@ void IoV2ClockBridge::resp_event_handler(vp::Block *_this, vp::ClockEvent *)
 
     // Deliver every response that has crossed the bridge so far, now aligned
     // on a master (cluster) clock edge.
-    while (!self->resp_queue.empty())
+    if (!self->resp_held)
     {
-        vp::IoReq *req = self->resp_queue.front();
-        self->resp_queue.pop_front();
-        self->in.resp(req);
+        self->deliver_resps();
+    }
+}
+
+
+void IoV2ClockBridge::deliver_resps()
+{
+    while (!this->resp_queue.empty())
+    {
+        vp::IoReq *req = this->resp_queue.front();
+        if (this->in.resp(req) == vp::IO_RESP_DENIED)
+        {
+            // The master keeps nothing of a denied response: it stays at the
+            // head of the queue until the master calls resp_retry().
+            this->resp_held = true;
+            return;
+        }
+        this->resp_queue.pop_front();
+    }
+}
+
+
+void IoV2ClockBridge::in_resp_retry_handler(vp::Block *__this, vp::IoRetryChannel channel)
+{
+    IoV2ClockBridge *self = static_cast<IoV2ClockBridge *>(__this);
+
+    // The upstream master can take responses again. The held response has to
+    // be sent again from here, in the same cycle.
+    if (self->resp_held)
+    {
+        self->resp_held = false;
+        self->deliver_resps();
+        if (self->resp_held)
+        {
+            return;
+        }
+    }
+
+    if (self->resp_retry_owed)
+    {
+        self->resp_retry_owed = false;
+        self->slave_engine->sync();
+        self->out.resp_retry(channel);
     }
 }
 

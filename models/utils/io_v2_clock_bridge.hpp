@@ -104,6 +104,7 @@ private:
     // `this->parametric` to the fast or modeled path.
     static vp::IoReqStatus in_req_handler(vp::Block *__this, vp::IoReq *req);
     static vp::IoRespAck   out_resp_handler(vp::Block *__this, vp::IoReq *req);
+    static void            in_resp_retry_handler(vp::Block *__this, vp::IoRetryChannel channel);
     static void            out_retry_handler(vp::Block *__this, vp::IoRetryChannel);
 
     // sync_only-path response delivery, aligned on the master clock edge
@@ -133,7 +134,8 @@ private:
     // domain via retry_event (mirrors the rev path's CDC re-alignment).
     void schedule_retry();
 
-    vp::IoSlave  in{&IoV2ClockBridge::in_req_handler};
+    vp::IoSlave  in{&IoV2ClockBridge::in_req_handler,
+                    &IoV2ClockBridge::in_resp_retry_handler};
     vp::IoMaster out{&IoV2ClockBridge::out_retry_handler,
                      &IoV2ClockBridge::out_resp_handler};
     vp::Trace trace;
@@ -149,6 +151,14 @@ private:
     // sync_only-path state: responses pending delivery on the next master edge
     vp::ClockEvent *resp_event = nullptr;
     std::deque<vp::IoReq *> resp_queue;
+    // The upstream master denied the response at the head of resp_queue: it
+    // stays there until the master calls resp_retry().
+    bool resp_held = false;
+    // We denied a downstream response (the upstream master had denied it):
+    // the downstream holds it and waits for our resp_retry().
+    bool resp_retry_owed = false;
+    // Deliver the queued responses upstream, until one is denied.
+    void deliver_resps();
 
     // Parametric-path state (unused when k=0)
     vp::ClockEvent *fwd_src_event = nullptr;
