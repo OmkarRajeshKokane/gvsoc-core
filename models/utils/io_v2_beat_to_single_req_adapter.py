@@ -55,15 +55,23 @@ class IoV2BeatToSingleReqAdapterConfig(Config):
         "Cycles added to every write acknowledgement, on top of the latency reported by "
         "the downstream. It is a pipeline delay, like read_latency."
     ))
+    write_burst_half_cycles: int = cfg_field(default=0, dump=True, desc=(
+        "Cost of accepting one write burst, in half cycles (3 = a burst every 1.5 cycles: "
+        "two accepted back to back, then one cycle of back-pressure). 0 (default) accepts "
+        "a burst every cycle. Only the first beat of a burst pays it, the other beats "
+        "stream at one per cycle."
+    ))
 
 
 class IoV2BeatToSingleReqAdapter(Component):
 
     def __init__(self, parent: Component, name: str, beat_width: int,
-                 max_read_bursts: int = 4, read_latency: int = 0, write_latency: int = 0):
+                 max_read_bursts: int = 4, read_latency: int = 0, write_latency: int = 0,
+                 write_burst_half_cycles: int = 0):
         super().__init__(parent, name, config=IoV2BeatToSingleReqAdapterConfig(
             beat_width=beat_width, max_read_bursts=max_read_bursts,
-            read_latency=read_latency, write_latency=write_latency))
+            read_latency=read_latency, write_latency=write_latency,
+            write_burst_half_cycles=write_burst_half_cycles))
         self.set_component('utils.io_v2_beat_to_single_req_adapter')
         self._beat_width = beat_width
 

@@ -165,6 +165,23 @@ vp::IoReqStatus IoV2BeatToSingleReqAdapter::req_handler(vp::Block *__this, vp::I
     self->traces.assert(req->allocator != nullptr,
         "write beat is not allocator-backed (req=%p) — unported master", req);
 
+    if (req->is_first && self->cfg.write_burst_half_cycles > 0)
+    {
+        // Measured on the RTL bridge: single-beat write bursts are accepted
+        // two in a row then held one cycle. Modelled as a cost per burst on a
+        // half-cycle scale, with at most one burst of backlog.
+        int64_t now2 = 2 * self->clock.get_cycles();
+        int64_t backlog = self->write_busy_until - now2;
+        if (backlog > 0 && backlog >= self->cfg.write_burst_half_cycles - 1)
+        {
+            self->write_blocked = true;
+            self->reschedule_fsm();
+            return vp::IO_REQ_DENIED;
+        }
+        self->write_busy_until = std::max(self->write_busy_until, now2)
+            + self->cfg.write_burst_half_cycles;
+    }
+
     if (req->is_first || self->open_wr_burst == nullptr)
     {
         if (!req->is_first)
@@ -782,6 +799,15 @@ void IoV2BeatToSingleReqAdapter::fsm_handler(vp::Block *__this, vp::ClockEvent *
     auto *self = static_cast<IoV2BeatToSingleReqAdapter *>(__this);
     int64_t now = self->clock.get_cycles();
 
+    // A write burst was denied for the write-burst pacing: let the master
+    // re-send it once the backlog is below one burst again.
+    if (self->write_blocked
+        && self->write_busy_until - 2 * now < self->cfg.write_burst_half_cycles - 1)
+    {
+        self->write_blocked = false;
+        self->in.retry(vp::IO_RETRY_WRITE);
+    }
+
     // Emit due read beats. Stop the instant one is back-pressured (resp_held):
     // the held beat must be re-sent first, from resp_retry_in_handler.
     while (!self->resp_held && !self->read_pending.empty()
@@ -845,6 +871,12 @@ void IoV2BeatToSingleReqAdapter::reschedule_fsm()
     {
         const WriteAckStream &b = this->ack_streams.front();
         next = std::min(next, b.first_ready + (int64_t)b.emitted_beats * b.step);
+    }
+    // A denied write burst wants the cycle where the backlog allows it.
+    if (this->write_blocked)
+    {
+        int64_t half = this->write_busy_until - (this->cfg.write_burst_half_cycles - 1) - 2 * now;
+        next = std::min(next, now + std::max((int64_t)1, (half + 1) / 2));
     }
     // A burst still to issue (head of the issue chain; room in the window, not
     // held) wants the next cycle.
@@ -960,6 +992,8 @@ void IoV2BeatToSingleReqAdapter::reset(bool active)
         this->drain_bursts.clear();
         this->outstanding_read_bursts = 0;
         this->read_blocked = false;
+        this->write_blocked = false;
+        this->write_busy_until = 0;
         // Sub-reads still owned by the adapter (issued downstream or completed
         // and awaiting upstream emit) go back to their pool; the master-owned
         // burst requests are not ours to free.

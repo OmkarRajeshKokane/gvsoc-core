@@ -290,6 +290,14 @@ private:
     // owed an in.retry() once a slot frees.
     bool read_blocked = false;
 
+    // Write-burst pacing (cfg.write_burst_half_cycles): the half cycle up to
+    // which the write side is busy with the bursts accepted so far. A new
+    // burst is denied while the backlog reaches one burst; the master is
+    // owed an in.retry(IO_RETRY_WRITE) then, raised from the fsm once the
+    // backlog has drained enough.
+    int64_t write_busy_until = 0;
+    bool write_blocked = false;
+
     // Sub-reads issued downstream (GRANTED) and awaiting their async response, in
     // strict issue order. Holds just the req pointers — the response must come
     // back on the front one (in-order, asserted); the beat framing is derived
