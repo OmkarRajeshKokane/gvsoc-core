@@ -76,6 +76,25 @@ void LsuV2::reset(bool active)
 bool LsuV2::data_req_virtual(iss_insn_t *insn, iss_addr_t addr, int size,
                               vp::IoReqOpcode opcode, bool is_signed, int reg, int reg2)
 {
+#ifdef CONFIG_GVSOC_ISS_TRAP_MISALIGNED
+    // Like RI5CY without misaligned support: any access not aligned on its size
+    // traps, and is not issued.
+    if (addr & (size - 1))
+    {
+        vp_warning_always(&this->trace,
+            "Misaligned %s (pc: 0x%" PRIxFULLREG ", addr: 0x%" PRIxFULLREG ", size: %d)\n",
+            opcode != 0 ? "store" : "load", this->iss.exec.current_insn, addr, size);
+#ifdef CONFIG_GVSOC_ISS_RISCV_EXCEPTIONS
+        this->iss.exception.raise(this->iss.exec.current_insn,
+            opcode != 0 ? ISS_EXCEPT_STORE_MISALIGNED : ISS_EXCEPT_LOAD_MISALIGNED);
+#else
+        // Without RISC-V exceptions there is a single trap path, whatever the id
+        this->iss.exception.raise(this->iss.exec.current_insn, ISS_EXCEPT_ILLEGAL);
+#endif
+        return false;
+    }
+#endif
+
     iss_addr_t phys_addr;
     bool use_mem_array;
     if (opcode != 0)

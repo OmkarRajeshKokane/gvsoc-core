@@ -352,7 +352,7 @@ class RiscvCommon(st.Component):
             wrapper: str="pulp/cpu/iss/default_iss_wrapper.cpp",
             memory_star: int|None=None,
             memory_size: int|None=None,
-            handle_misaligned: bool=False,
+            handle_misaligned: bool=True,
             external_pccr: bool=False,
             custom_sources: bool=False,
             float_lib: str='flexfloat',
@@ -390,6 +390,11 @@ class RiscvCommon(st.Component):
             raise RuntimeError(f'Unsupported float lib: {float_lib}')
 
         self.add_c_flags([f'-DCONFIG_GVSOC_ISS_FLOAT_USE_{float_lib.upper()}=1'])
+
+        # A core that does not handle misaligned accesses traps on them, instead
+        # of having the LSU split them into aligned beats.
+        if not handle_misaligned:
+            self.add_c_flags(['-DCONFIG_GVSOC_ISS_TRAP_MISALIGNED=1'])
 
         if float_lib == 'softfloat':
             self.add_sources([
