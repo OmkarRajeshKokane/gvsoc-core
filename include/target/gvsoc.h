@@ -51,6 +51,8 @@ extern "C" {
 #define SEMIHOSTING_GV_STATS_START            0x117
 #define SEMIHOSTING_GV_STATS_STOP             0x118
 #define SEMIHOSTING_GV_STATS_DUMP             0x119
+#define SEMIHOSTING_GV_STACK_SET              0x11A
+#define SEMIHOSTING_GV_MEMCHECK_START          0x11B
 
 
 
@@ -627,6 +629,27 @@ static inline void gv_stats_dump()
  */
 
 
+/** \brief Declare the current stack of the calling core.
+ *
+ * This function can be called to declare to the simulator the stack on which
+ * the calling core is about to execute (at boot, when creating or switching
+ * threads, or when a cluster core takes its fork stack). The ISS then checks
+ * that any write to the stack pointer stays within the declared range, and
+ * dumps the current stack usage as a trace event which the GUI can display as
+ * an analog signal.
+ *
+ * The declaration can be done before the stack pointer actually enters the
+ * declared range (e.g. just before a context switch); the checks only arm
+ * once the stack pointer first lands inside it.
+ *
+ * \param base The lowest address of the stack.
+ * \param size The size of the stack in bytes. A size of 0 disables the checks.
+ */
+static inline void gv_stack_set(void *base, size_t size)
+{
+    gvsoc_semihost_3args(SEMIHOSTING_GV_STACK_SET, (long)base, (long)size);
+}
+
 static inline void *gv_memcheck_mem_alloc(int mem_id, void *ptr, size_t size)
 {
     return (void *)gvsoc_semihost_4args(SEMIHOSTING_GV_MEMCHECK_MEM_ALLOC,
@@ -637,6 +660,23 @@ static inline void *gv_memcheck_mem_free(int mem_id, void *ptr, size_t size)
 {
     return (void *)gvsoc_semihost_4args(SEMIHOSTING_GV_MEMCHECK_MEM_FREE,
         mem_id, (uint32_t)ptr, (uint32_t)size);
+}
+
+/** \brief Start memory checking on the calling core.
+
+ * The checker considers a register uninitialised until something writes it, and
+ * arms that at core reset. On a chip which boots from a ROM that is too early:
+ * the firmware initialises the whole register file before the application is
+ * entered, and the runtime then spills those values onto the application stack,
+ * where they look like initialised data.
+ *
+ * The runtime calls this from its startup code, before it uses the stack, to
+ * move the origin to the point the application really starts. Memory already
+ * written stays initialised, which is correct -- the ROM did write it.
+ */
+static inline void gv_memcheck_start(void)
+{
+    gvsoc_semihost(SEMIHOSTING_GV_MEMCHECK_START, 0);
 }
 
 /**

@@ -19,6 +19,8 @@
 # Authors: Germain Haugou, GreenWaves Technologies (germain.haugou@greenwaves-technologies.com)
 #
 
+from __future__ import annotations
+
 import collections
 
 
@@ -728,15 +730,15 @@ class Isa(object):
 
         return includes
 
-    def add_include(self, include):
+    def add_include(self, include: str):
         if not include in self.includes:
             self.includes.append(include)
 
-    def add_implem_include(self, include):
+    def add_implem_include(self, include: str):
         if not include in self.implem_includes:
             self.implem_includes.append(include)
 
-    def add_define(self, name, value):
+    def add_define(self, name: str, value: str):
         self.defines[name] = value
 
     def alloc_decoder_tree_id(self):

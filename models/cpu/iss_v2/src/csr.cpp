@@ -125,25 +125,17 @@ Csr::Csr(Iss &iss)
 
     this->tselect.register_callback(std::bind(&Csr::tselect_access, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
 
-    #if defined(CONFIG_GVSOC_ISS_RI5KY) || defined(CONFIG_GVSOC_ISS_HWLOOP)
-    this->hwloop_regs[PULPV2_HWLOOP_LPCOUNT(0)] = 0;
-    this->hwloop_regs[PULPV2_HWLOOP_LPCOUNT(1)] = 0;
-    #endif
+    // Hwloop register storage and reset live in the Hwloop module now.
 }
 
 void Csr::reset(bool active)
 {
     if (active)
     {
-#if defined(CONFIG_GVSOC_ISS_RI5KY) || defined(CONFIG_GVSOC_ISS_HWLOOP)
-        memset(this->hwloop_regs, 0, sizeof(this->hwloop_regs));
-#endif
+        // Hwloop reset is handled by the Hwloop module.
     #if defined(ISS_HAS_PERF_COUNTERS)
         this->pcmr = 0;
         this->pcer = 3;
-    #endif
-    #if defined(CONFIG_GVSOC_ISS_STACK_CHECKER)
-        this->stack_conf = 0;
     #endif
         this->dcsr = 4 << 28;
         this->fcsr.raw = 0;
@@ -513,52 +505,6 @@ static bool mhpmevent_write(Iss *iss, unsigned int value, int id)
  *   PULP CSRS
  */
 
-#ifdef CONFIG_GVSOC_ISS_STACK_CHECKER
-
-static bool stack_conf_write(Iss *iss, iss_reg_t value)
-{
-    iss->csr.stack_conf = value;
-
-    if (iss->csr.stack_conf)
-        iss->csr.trace.msg("Activating stack checking (start: 0x%x, end: 0x%x)\n", iss->csr.stack_start, iss->csr.stack_end);
-    else
-        iss->csr.trace.msg("Deactivating stack checking\n");
-
-    return false;
-}
-
-static bool stack_conf_read(Iss *iss, iss_reg_t *value)
-{
-    *value = iss->csr.stack_conf;
-    return false;
-}
-
-static bool stack_start_write(Iss *iss, iss_reg_t value)
-{
-    iss->csr.stack_start = value;
-    return false;
-}
-
-static bool stack_start_read(Iss *iss, iss_reg_t *value)
-{
-    *value = iss->csr.stack_start;
-    return false;
-}
-
-static bool stack_end_write(Iss *iss, iss_reg_t value)
-{
-    iss->csr.stack_end = value;
-    return false;
-}
-
-static bool stack_end_read(Iss *iss, iss_reg_t *value)
-{
-    *value = iss->csr.stack_end;
-    return false;
-}
-
-#endif
-
 static bool umode_read(Iss *iss, iss_reg_t *value)
 {
     *value = 3;
@@ -645,27 +591,33 @@ static bool pcmr_write(Iss *iss, unsigned int prev_val, unsigned int value)
 }
 
 #if defined(CONFIG_GVSOC_ISS_RI5KY) || defined(CONFIG_GVSOC_ISS_HWLOOP)
+// Hwloop CSR layout: LPSTART(0), LPEND(0), LPCOUNT(0), pad, LPSTART(1), LPEND(1), LPCOUNT(1).
+// Translate a flat reg index 0..6 into the matching Hwloop module call.
 static bool hwloop_read(Iss *iss, int reg, iss_reg_t *value)
 {
-    *value = iss->csr.hwloop_regs[reg];
+    int idx = reg / 4;
+    int field = reg % 4;
+    switch (field)
+    {
+        case 0: *value = iss->hwloop.get_start(idx); break;
+        case 1: *value = iss->hwloop.get_end(idx);   break;
+        case 2: *value = iss->hwloop.get_count(idx); break;
+        default: *value = 0; break;
+    }
     return false;
 }
 
 static bool hwloop_write(Iss *iss, int reg, unsigned int value)
 {
-    iss->csr.hwloop_regs[reg] = value;
-
-    // Since the HW loop is using decode instruction for the HW loop start to jump faster
-    // we need to recompute it when it is modified.
-    if (reg == 0)
+    int idx = reg / 4;
+    int field = reg % 4;
+    switch (field)
     {
-        iss->exec.hwloop_start_insn[0] = value;
+        case 0: iss->hwloop.set_start(idx, value); break;
+        case 1: iss->hwloop.set_end(idx, value);   break;
+        case 2: iss->hwloop.set_count(idx, value); break;
+        default: break;
     }
-    else if (reg == 4)
-    {
-        iss->exec.hwloop_start_insn[1] = value;
-    }
-
     return false;
 }
 #endif
@@ -1179,18 +1131,6 @@ bool iss_csr_read(Iss *iss, iss_insn_t *insn, iss_reg_t reg, iss_reg_t *value)
         break;
 #endif
 
-#ifdef CONFIG_GVSOC_ISS_STACK_CHECKER
-    case CSR_STACK_CONF:
-        status = stack_conf_read(iss, value);
-        break;
-    case CSR_STACK_START:
-        status = stack_start_read(iss, value);
-        break;
-    case CSR_STACK_END:
-        status = stack_end_read(iss, value);
-        break;
-#endif
-
 #if defined(CONFIG_GVSOC_ISS_SNITCH)
     case 0x7d0:
     case 0x7d1:
@@ -1313,23 +1253,11 @@ bool iss_csr_write(Iss *iss, iss_insn_t *insn, iss_reg_t reg, iss_reg_t value)
     case 0xF13:
     case 0xF14:
         return false;
-#ifdef CONFIG_GVSOC_ISS_STACK_CHECKER
-    case CSR_STACK_CONF:
-        return stack_conf_write(iss, value);
-        break;
-    case CSR_STACK_START:
-        return stack_start_write(iss, value);
-        break;
-    case CSR_STACK_END:
-        return stack_end_write(iss, value);
-        break;
-#else
     case 0x7d0:
     case 0x7d1:
     case 0x7d2:
         return false;
         break;
-#endif
     }
 
 #if defined(ISS_HAS_PERF_COUNTERS)
@@ -1610,14 +1538,6 @@ const char *iss_csr_name(Iss *iss, iss_reg_t reg)
     case 0x7b3:
         return "scratch1";
 
-#ifdef CONFIG_GVSOC_ISS_STACK_CHECKER
-    case CSR_STACK_CONF:
-        return "stack_conf";
-    case CSR_STACK_START:
-        return "stack_start";
-    case CSR_STACK_END:
-        return "stack_end";
-#endif
     }
 
 #if defined(ISS_HAS_PERF_COUNTERS)

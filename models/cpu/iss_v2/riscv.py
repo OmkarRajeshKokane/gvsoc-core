@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from inspect import stack
 #
 # Copyright (C) 2020 GreenWaves Technologies, SAS, ETH Zurich and University of Bologna
@@ -16,11 +18,12 @@ from inspect import stack
 #
 
 import os
-import subprocess
 from typing_extensions import Any, override
 import gvsoc.systree
 import gvsoc.systree as st
 from gvsoc.systree import Component
+from gvsoc.signature import IoV2SingleReq
+import gvrun.timing
 import os.path
 import gvsoc.gui
 from gvsoc.gui import Signal
@@ -33,7 +36,6 @@ from cpu.iss_v2.riscv_config import RiscvConfig
 
 binaries_info = {}
 
-binaries = {}
 
 
 class IssModule:
@@ -42,30 +44,75 @@ class IssModule:
         pass
 
 class Arch(IssModule):
-    def __init__(self, class_name: str='EmptyModule'):
+    def __init__(self, class_name: str='EmptyModule', source: str|None=None):
         self.class_name: str = class_name
+        self.source: str|None = source
 
-    def gen(self, iss):
+    def gen(self, iss: Component):
         iss.isa.add_define('CONFIG_GVSOC_ISS_ARCH', self.class_name)
         if self.class_name != 'EmptyModule':
             iss.isa.add_include(f'<cpu/iss_v2/include/cores/{self.class_name.lower()}/{self.class_name.lower()}.hpp>')
+            if self.source is not None:
+                iss.add_sources([self.source])
 
 class ExecInOrder(IssModule):
-    def __init__(self, scoreboard: bool=False):
-        self.scoreboard = scoreboard
+    """In-order single-issue execution / commit engine.
 
-    def gen(self, iss):
-        iss.isa.add_define('CONFIG_GVSOC_ISS_EXEC', 'ExecInOrder')
+    Drives the per-cycle dispatch loop (fetch -> decode -> execute) for
+    an in-order, single-issue pipeline and tracks the in-flight insns
+    needed to model asynchronous LSU responses and WFI wake-ups.
+
+    Two opt-in features, useful for narrow in-order cores such as
+    Ri5ky / CV32E40P, are configurable per core:
+
+    ``scoreboard=True``
+        Track live destination-register bits. The dispatcher stalls a
+        new insn whose source register set intersects the live mask.
+        When paired with :class:`LsuV2`, every load response is staged
+        through a single-slot 1-cycle delay (``schedule_scoreboard_release``)
+        before the scoreboard bits actually clear — modelling the
+        classic load-use stall: a dependent insn dispatched the same
+        cycle the response lands still sees the destination as in
+        flight. Sets ``CONFIG_GVSOC_ISS_REGFILE_SCOREBOARD``.
+
+    ``inorder_commit=True``
+        Enable an in-order commit FIFO so that the simulator's
+        instruction trace is dumped strictly in dispatch order, even
+        when LSU responses arrive out of program order (``nb_outstanding > 1``
+        with mixed latencies) or when independent sync insns dispatch
+        while an async load is still in flight. Held async insns are
+        appended with ``ready=false``; sync followers dispatched in
+        the meantime are appended with ``ready=true`` (their result
+        is already in the regfile and their scoreboard bits are
+        cleared at dispatch). Each LSU response flips the matching
+        entry's ready bit and drains the FIFO from the head while
+        heads are ready. Sets ``CONFIG_GVSOC_ISS_EXEC_INORDER_COMMIT``.
+
+    Both features compile out cleanly when not requested; cores that
+    do not opt in see no overhead and no behavioural change.
+    """
+    def __init__(self, class_name:str='ExecInOrder', scoreboard: bool=False,
+                 inorder_commit: bool=False):
+        self.scoreboard = scoreboard
+        self.class_name = class_name
+        self.inorder_commit = inorder_commit
+
+    @override
+    def gen(self, iss: RiscvCommon):
+        iss.isa.add_define('CONFIG_GVSOC_ISS_EXEC', self.class_name)
         iss.isa.add_include('<cpu/iss_v2/include/exec/exec_inorder.hpp>')
         iss.isa.add_implem_include('<cpu/iss_v2/include/exec/exec_inorder_implem.hpp>')
         iss.add_sources(['cpu/iss_v2/src/exec/exec_inorder.cpp'])
         if self.scoreboard:
             iss.isa.add_define('CONFIG_GVSOC_ISS_EXEC_SCOREBOARD', '1')
+        if self.inorder_commit:
+            iss.isa.add_define('CONFIG_GVSOC_ISS_EXEC_INORDER_COMMIT', '1')
 
 class Regfile(IssModule):
     def __init__(self, scoreboard: bool=False):
         self.scoreboard = scoreboard
 
+    @override
     def gen(self, iss):
         iss.isa.add_define('CONFIG_GVSOC_ISS_REGFILE', 'Regfile')
         iss.isa.add_include('<cpu/iss_v2/include/regfile.hpp>')
@@ -74,26 +121,30 @@ class Regfile(IssModule):
             iss.isa.add_define('CONFIG_GVSOC_ISS_REGFILE_SCOREBOARD', '1')
 
 class Csr(IssModule):
-    def gen(self, iss):
+    @override
+    def gen(self, iss: RiscvCommon):
         iss.isa.add_define('CONFIG_GVSOC_ISS_CSR', 'Csr')
         iss.isa.add_include('<cpu/iss_v2/include/csr.hpp>')
         iss.add_sources(['cpu/iss_v2/src/csr.cpp'])
 
 class Core(IssModule):
-    def gen(self, iss):
+    @override
+    def gen(self, iss: RiscvCommon):
         iss.isa.add_define('CONFIG_GVSOC_ISS_CORE', 'Core')
         iss.isa.add_include('<cpu/iss_v2/include/core.hpp>')
         iss.add_sources(['cpu/iss_v2/src/core.cpp'])
 
 class Irq(IssModule):
-    def gen(self, iss):
+    @override
+    def gen(self, iss: RiscvCommon):
         iss.isa.add_define('CONFIG_GVSOC_ISS_IRQ', 'IrqRiscv')
         iss.isa.add_define('CONFIG_GVSOC_ISS_RISCV_EXCEPTIONS', 1)
         iss.isa.add_include('<cpu/iss_v2/include/irq/irq_riscv.hpp>')
         iss.add_sources(['cpu/iss_v2/src/irq/irq_riscv.cpp'])
 
 class IrqExternal(IssModule):
-    def gen(self, iss):
+    @override
+    def gen(self, iss: RiscvCommon):
         iss.isa.add_define('CONFIG_GVSOC_ISS_IRQ', 'IrqExternal')
         iss.isa.add_include('<cpu/iss_v2/include/irq/irq_external.hpp>')
         iss.add_sources(['cpu/iss_v2/src/irq/irq_external.cpp'])
@@ -102,61 +153,149 @@ class PrefetchSingleLine(IssModule):
     def __init__(self, scoreboard: bool=False, size=16):
         self.size = size
 
-    def gen(self, iss):
+    @override
+    def gen(self, iss: RiscvCommon):
         iss.isa.add_define('CONFIG_GVSOC_ISS_PREFETCH', 'PrefetchSingleLine')
         iss.isa.add_define('CONFIG_GVSOC_ISS_PREFETCH_SIZE', self.size)
         iss.isa.add_include('<cpu/iss_v2/include/prefetch/prefetch_single_line.hpp>')
         iss.add_sources(['cpu/iss_v2/src/prefetch/prefetch_single_line.cpp'])
 
 class Lsu(IssModule):
-    def gen(self, iss):
+    def __init__(self, nb_outstanding: int=1):
+        self.nb_outstanding = nb_outstanding
+
+    @override
+    def gen(self, iss: RiscvCommon):
         iss.isa.add_define('CONFIG_GVSOC_ISS_LSU', 'Lsu')
-        iss.isa.add_define('CONFIG_GVSOC_ISS_LSU_NB_OUTSTANDING', 1)
+        iss.isa.add_define('CONFIG_GVSOC_ISS_LSU_NB_OUTSTANDING', self.nb_outstanding)
         iss.isa.add_include('<cpu/iss_v2/include/lsu.hpp>')
         iss.add_sources(['cpu/iss_v2/src/lsu.cpp'])
         iss.isa.add_implem_include('<cpu/iss_v2/include/lsu_implem.hpp>')
 
+class LsuV2(IssModule):
+    """io_v2 LSU variant.
+
+    Drop-in replacement for :class:`Lsu` that wires the ISS ``data`` port
+    through the v2 IO protocol (``vp/itf/io_v2.hpp``) instead of v1
+    (``vp/itf/io.hpp``). Pass ``modules={'lsu': LsuV2()}`` to
+    :class:`Riscv` (or :class:`RiscvCommon`) to switch the core from the
+    default v1 LSU to this one.
+
+    Enabling ``LsuV2`` also forces every translation unit of the ISS to
+    include ``io_v2.hpp`` (via a conditional in ``types.hpp``), because
+    the two protocols share the same ``vp::IoReq`` / ``vp::IoMaster``
+    class names and cannot coexist in the same unit.
+
+    Notes
+    -----
+    - The Ara vector LSU extension is v1-only. Combining it with
+      :class:`LsuV2` will not compile. Use the v1 :class:`Lsu` when
+      building with Ara.
+    - ``syscalls.cpp`` and other users of ``iss.lsu.data`` have been
+      guarded with ``#ifdef CONFIG_GVSOC_ISS_LSU_V2`` so they work in
+      both modes.
+    """
+    def __init__(self, nb_outstanding: int=1, width: int=4,
+                 class_name: str='LsuV2'):
+        self.nb_outstanding = nb_outstanding
+        # Width in bytes of the data port. An access crossing a port-word
+        # boundary is split into two serialized beats, so this decides
+        # whether an 8-byte FP load is one memory access or two. 4 is the
+        # historical value (32-bit port); cores with a 64-bit scalar data
+        # path (snitch/spatz) pass 8.
+        self.width = width
+        self.class_name = class_name
+
+    @override
+    def gen(self, iss: RiscvCommon):
+        iss.isa.add_define('CONFIG_GVSOC_ISS_LSU', self.class_name)
+        iss.isa.add_define('CONFIG_GVSOC_ISS_LSU_V2', '1')
+        iss.isa.add_define('CONFIG_GVSOC_ISS_LSU_NB_OUTSTANDING', self.nb_outstanding)
+        iss.isa.add_define('CONFIG_GVSOC_ISS_LSU_WIDTH', self.width)
+        iss.isa.add_include('<cpu/iss_v2/include/lsu_v2.hpp>')
+        iss.add_sources(['cpu/iss_v2/src/lsu_v2.cpp'])
+        iss.isa.add_implem_include('<cpu/iss_v2/include/lsu_v2_implem.hpp>')
+        # Tell the iss that fetch/data master ports speak the io_v2 protocol
+        # so o_FETCH / o_DATA / o_DATA_DEBUG bind with the IoV2SingleReq signature.
+        iss._uses_io_v2 = True
+
 class Exception(IssModule):
-    def gen(self, iss):
+    @override
+    def gen(self, iss: RiscvCommon):
         iss.isa.add_define('CONFIG_GVSOC_ISS_EXCEPTION', 'Exception')
         iss.isa.add_include('<cpu/iss_v2/include/exception.hpp>')
         iss.add_sources(['cpu/iss_v2/src/exception.cpp'])
 
 class Pmp(IssModule):
-    def gen(self, iss):
+    @override
+    def gen(self, iss: RiscvCommon):
         iss.isa.add_define('CONFIG_GVSOC_ISS_PMP', 'Pmp')
         iss.isa.add_include('<cpu/iss_v2/include/pmp/pmp.hpp>')
         iss.add_sources(["cpu/iss_v2/src/pmp.cpp"])
 
 class PmpEmpty(IssModule):
-    def gen(self, iss):
+    @override
+    def gen(self, iss: RiscvCommon):
         iss.isa.add_define('CONFIG_GVSOC_ISS_PMP', 'PmpEmpty')
         iss.isa.add_include('<cpu/iss_v2/include/pmp/empty.hpp>')
 
 class Mmu(IssModule):
-    def gen(self, iss):
+    @override
+    def gen(self, iss: RiscvCommon):
         iss.isa.add_define('CONFIG_GVSOC_ISS_MMU', 'Mmu')
+        # Boolean marker for code which must only be compiled when the real MMU is
+        # included, like the LSU routing of page-table walk responses
+        iss.isa.add_define('CONFIG_GVSOC_ISS_MMU_ENABLED', '1')
         iss.isa.add_include('<cpu/iss_v2/include/mmu/mmu.hpp>')
         iss.add_sources(["cpu/iss_v2/src/mmu.cpp"])
         iss.isa.add_implem_include('<cpu/iss_v2/include/mmu/mmu_implem.hpp>')
 
 class MmuEmpty(IssModule):
-    def gen(self, iss):
+    @override
+    def gen(self, iss: RiscvCommon):
         iss.isa.add_define('CONFIG_GVSOC_ISS_MMU', 'MmuEmpty')
         iss.isa.add_include('<cpu/iss_v2/include/mmu/empty.hpp>')
 
 class Offload(IssModule):
-    def gen(self, iss):
+    @override
+    def gen(self, iss: RiscvCommon):
         iss.isa.add_define('CONFIG_GVSOC_ISS_OFFLOAD', 'Offload')
         iss.isa.add_include('<cpu/iss_v2/include/offload.hpp>')
         iss.add_sources(['cpu/iss_v2/src/offload.cpp'])
 
 class Event(IssModule):
-    def gen(self, iss):
+    @override
+    def gen(self, iss: RiscvCommon):
         iss.isa.add_define('CONFIG_GVSOC_ISS_EVENT', 'Events')
         iss.isa.add_include('<cpu/iss_v2/include/event/event.hpp>')
         iss.add_sources(['cpu/iss_v2/src/event/event.cpp'])
         iss.isa.add_implem_include('<cpu/iss_v2/include/event/event_implem.hpp>')
+
+
+class Hwloop(IssModule):
+    """Hardware-loop module (CoreV / PULP-style ``Xhwloop``).
+
+    Plug into the ``hwloop`` slot of :class:`Riscv` / :class:`RiscvCommon`
+    to enable hardware-loop semantics: each loop has a (start, end,
+    count) triple, and after every retired instruction the dispatch
+    loop calls ``iss.hwloop.check(pc, next_pc)`` to redirect to the
+    loop start when a counter is non-zero.
+
+    Cores that omit this module fall back to the empty slot (``HwloopEmpty``)
+    whose ``check()`` is a no-op the compiler eliminates from the
+    dispatch hot path.
+    """
+    def __init__(self, nb_loops: int = 2):
+        self.nb_loops = nb_loops
+
+    @override
+    def gen(self, iss):
+        iss.isa.add_define('CONFIG_GVSOC_ISS_HWLOOP', '1')
+        iss.isa.add_define('CONFIG_GVSOC_ISS_HWLOOP_OBJ', 'Hwloop')
+        iss.isa.add_define('CONFIG_GVSOC_ISS_NB_HWLOOP', self.nb_loops)
+        iss.isa.add_include('<cpu/iss_v2/include/hwloop/hwloop.hpp>')
+        iss.add_sources(['cpu/iss_v2/src/hwloop/hwloop.cpp'])
+        iss.isa.add_implem_include('<cpu/iss_v2/include/hwloop/hwloop_implem.hpp>')
 
 
 class RiscvCommon(st.Component):
@@ -173,8 +312,6 @@ class RiscvCommon(st.Component):
         The index of the first PCER which is retrieved externally (default: 0).
     riscv_dbg_unit : bool, optional
         True if a riscv debug unit should be included, False otherwise (default: False).
-    debug_binaries : list, optional
-        A list of path to riscv binaries debug info which can be used to get debug symbols for the assembly trace (default: []).
     binaries : list, optional
         A list of path to riscv binaries (default: []).
     debug_handler : int, optional
@@ -183,6 +320,10 @@ class RiscvCommon(st.Component):
         A dictionnay describing all the power models used to estimate power consumption in the ISS (default: {})
     power_models_file : file, optional
         A path to a file describing all the power models used to estimate power consumption in the ISS (default: None)
+    regfile_fi: bool, optional
+        True if the register files of this core are fault-injected
+    prefetcher_fi: bool, optional
+        True if the prefetcher buffer of this core is fault-injected
     cluster_id : int, optional
         The cluster ID of the core simulated by the ISS (default: 0).
     """
@@ -191,11 +332,10 @@ class RiscvCommon(st.Component):
             parent: Component,
             name: str,
             config: RiscvConfig,
-            isa: Isa|None,
+            isa: Isa,
             misa: int|None=None,
             first_external_pcer: int=0,
             riscv_dbg_unit: bool=False,
-            debug_binaries: list[str]=[],
             binaries: list[str]=[],
             debug_handler: int=0,
             power_models: dict[str,Any]={},
@@ -206,13 +346,13 @@ class RiscvCommon(st.Component):
             supervisor: bool=False,
             user: bool=False,
             internal_atomics: bool=False,
-            timed: bool=True,
+            timed: bool | None=None,
             scoreboard: bool=False,
             prefetcher_size: int|None=None,
             wrapper: str="pulp/cpu/iss/default_iss_wrapper.cpp",
             memory_star: int|None=None,
             memory_size: int|None=None,
-            handle_misaligned: bool=False,
+            handle_misaligned: bool=True,
             external_pccr: bool=False,
             custom_sources: bool=False,
             float_lib: str='flexfloat',
@@ -222,6 +362,8 @@ class RiscvCommon(st.Component):
             zfinx: bool=False,
             zdinx: bool=False,
             fp_width: int | None = None,
+            regfile_fi: bool=False,
+            prefetcher_fi: bool=False,
             modules: dict[str, IssModule] | None = None
         ):
 
@@ -231,9 +373,14 @@ class RiscvCommon(st.Component):
            else:
                misa = 0
 
-        super().__init__(parent, name)
+        super().__init__(parent, name, config=config)
 
-        self.isa: str = isa
+        # Default to v1 IO protocol on the master ports. ``LsuV2.gen()`` flips
+        # this to True so o_FETCH / o_DATA / o_DATA_DEBUG bind with the
+        # IoV2SingleReq signature.
+        self._uses_io_v2: bool = False
+
+        self.isa: Isa = isa
 
         self.add_c_flags([
             f'--include {isa.get_header()}'
@@ -243,6 +390,11 @@ class RiscvCommon(st.Component):
             raise RuntimeError(f'Unsupported float lib: {float_lib}')
 
         self.add_c_flags([f'-DCONFIG_GVSOC_ISS_FLOAT_USE_{float_lib.upper()}=1'])
+
+        # A core that does not handle misaligned accesses traps on them, instead
+        # of having the LSU split them into aligned beats.
+        if not handle_misaligned:
+            self.add_c_flags(['-DCONFIG_GVSOC_ISS_TRAP_MISALIGNED=1'])
 
         if float_lib == 'softfloat':
             self.add_sources([
@@ -309,11 +461,33 @@ class RiscvCommon(st.Component):
 
         self.add_c_flags(['-DCONFIG_GVSOC_ISS_V2=1'])
 
+        # When not explicitly set, derive the timing model from the
+        # hierarchical timing level: only 'functional' disables it ('cycle'
+        # snaps to 'timed', the ISS has no finer-grained model).
+        if timed is None:
+            timed = self.get_timing_level(
+                supported=[gvrun.timing.FUNCTIONAL, gvrun.timing.TIMED]) != gvrun.timing.FUNCTIONAL
+        self.add_property('timed', timed)
+
         if timed:
             self.add_c_flags(['-DCONFIG_GVSOC_ISS_TIMED=1'])
 
         if zfinx or isa.has_extension('zfinx'):
             self.add_c_flags(['-DCONFIG_GVSOC_ISS_ZFINX=1'])
+
+        if zdinx or isa.has_extension('zdinx'):
+            self.add_c_flags(['-DCONFIG_GVSOC_ISS_ZDINX=1'])
+
+        if stack_checker:
+            # Runtime-declared stack bounds (SEMIHOSTING_GV_STACK_SET): SP
+            # writes are checked against them and the stack usage is dumped as
+            # a real trace event. See Regfile::stack_set.
+            self.add_c_flags(['-DCONFIG_GVSOC_ISS_STACK_CHECKER=1'])
+        if regfile_fi:
+            self.add_c_flags(['-DCONFIG_REGFILE_FI=1'])
+
+        if prefetcher_fi:
+            self.add_c_flags(['-DCONFIG_PREFETCHER_FI=1'])
 
         fp_size = fp_width if fp_width is not None else  64 if isa.has_isa('rvd') else 32
         self.add_c_flags([f'-DCONFIG_GVSOC_ISS_FP_WIDTH={fp_size}'])
@@ -373,6 +547,7 @@ class RiscvCommon(st.Component):
             "cpu/iss_v2/src/decode.cpp",
             "cpu/iss_v2/src/trace.cpp",
             "cpu/iss_v2/src/syscalls.cpp",
+            "cpu/iss_v2/src/memcheck.cpp",
             "cpu/iss_v2/src/htif.cpp",
             "cpu/iss_v2/src/gdbserver.cpp",
         ])
@@ -382,7 +557,6 @@ class RiscvCommon(st.Component):
             'misa': misa,
             'first_external_pcer': first_external_pcer,
             'riscv_dbg_unit': riscv_dbg_unit,
-            'debug_binaries': debug_binaries.copy(),
             'binaries': binaries.copy(),
             'debug_handler': debug_handler,
             'power_models': power_models,
@@ -391,6 +565,7 @@ class RiscvCommon(st.Component):
             'fetch_enable': config.fetch_enable,
             'boot_addr': config.boot_addr,
             'has_double': isa.has_isa('rvd'),
+            'regfile_fi': regfile_fi,
         })
 
         self.htif = config.htif
@@ -417,35 +592,9 @@ class RiscvCommon(st.Component):
 
     def handle_executable(self, binary):
 
+        # Record the binary; the ISS resolves trace symbols from it lazily at
+        # runtime from the ELF binary (no precompute step, no binary-size cap).
         self.get_property('binaries').append(binary)
-
-        global binaries
-
-        path = binary
-        debug_info_path = os.path.join(os.path.dirname(path), f'debug_binary_{os.path.basename(path)}.debugInfo')
-
-        if binaries.get(path) is None:
-            binaries[path] = True
-
-            # Only generate debug symbols for small binaries, otherwise it is too slow
-            # To allow it, the ISS should itself read the symbols.
-            if os.path.getsize(path) < 5 * 1024*1024:
-                try:
-                    result = subprocess.run(
-                        ["gen-debug-info", path, debug_info_path],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL
-                    )
-                except Exception as e:
-                    print(f'{e}')
-                    result = subprocess.CompletedProcess(args=[], returncode=1)
-
-                if result.returncode != 0:
-                    print(f'Error while generating debug symbols information for binary: {path}')
-                    print('Make sure the toolchain and the binaries are accessible')
-
-        if os.path.getsize(path) < 5 * 1024*1024:
-            self.get_property('debug_binaries').append(debug_info_path)
 
         if self.htif:
             self.handle_htif(binary)
@@ -535,7 +684,11 @@ class RiscvCommon(st.Component):
         slave: gvsoc.systree.SlaveItf
             Slave interface
         """
-        self.itf_bind('fetch', itf, signature='io')
+        # Like the data port below, the fetch unit is a single-req initiator:
+        # each line fetch is one request answered by a single-beat response
+        # routed back by identity.
+        self.itf_bind('fetch', itf,
+            signature=IoV2SingleReq() if self._uses_io_v2 else 'io')
 
     def o_DATA(self, itf: gvsoc.systree.SlaveItf):
         """Binds the data port.
@@ -549,27 +702,20 @@ class RiscvCommon(st.Component):
         slave: gvsoc.systree.SlaveItf
             Slave interface
         """
-        self.itf_bind('data', itf, signature='io')
+        # SingleReq: the LSU owns its (pooled) request and recovers it on the
+        # response by identity, so the data port is a single-req initiator. The
+        # class signature also makes the framework insert the single-req-to-beat
+        # adapter when this binds to a beat plane (e.g. a KIND_BEAT router), so
+        # the LSU's own request never travels downstream — only the adapter's
+        # data-less one does — while outstanding accesses still pipeline.
+        self.itf_bind('data', itf,
+            signature=IoV2SingleReq() if self._uses_io_v2 else 'io')
 
     def o_MEMINFO(self, itf: gvsoc.systree.SlaveItf):
         self.itf_bind('meminfo', itf, signature='io')
 
     def o_TIME(self, itf: gvsoc.systree.SlaveItf):
         self.itf_bind('time', itf, signature='wire<uint64_t>')
-
-    def o_DATA_DEBUG(self, itf: gvsoc.systree.SlaveItf):
-        """Binds the data debug port.
-
-        This port is used for issuing data accesses from gdb server to the memory.\n
-        It instantiates a port of type vp::IoMaster.\n
-        If gdbserver is used It is mandatory to bind it.\n
-
-        Parameters
-        ----------
-        slave: gvsoc.systree.SlaveItf
-            Slave interface
-        """
-        self.itf_bind('data_debug', itf, signature='io')
 
     def o_FLUSH_CACHE(self, itf: gvsoc.systree.SlaveItf):
         self.itf_bind('flush_cache_req', itf, signature='wire<bool>')
@@ -642,7 +788,7 @@ class RiscvCommon(st.Component):
     @override
     def gen_gui(self, parent_signal: Signal) -> Signal:
         active = gvsoc.gui.Signal(self, parent_signal, name=self.name, path='active_function',
-            display=gvsoc.gui.DisplayStringBox(), include_traces=['active_pc', 'binaries'])
+            display=gvsoc.gui.DisplayStringBox(), include_traces=['active_pc', 'binaries'], opened=True)
 
         gvsoc.gui.Signal(self, active, path='active_pc', groups=['pc'])
         gvsoc.gui.Signal(self, active, path='binaries', groups=['pc'])
@@ -664,6 +810,12 @@ class RiscvCommon(st.Component):
             required_traces=['static_power_trace', 'dyn_power_trace'], display=gvsoc.gui.DisplayAnalog())
         gvsoc.gui.Signal(self, power_signal, name='dynamic', path='dyn_power_trace', groups='power')
         gvsoc.gui.Signal(self, power_signal, name='static', path='static_power_trace', groups='power')
+
+        # Stack usage curve, dumped by the ISS stack checker when the runtime
+        # declares its stacks (gv_stack_set). Max aggregation so short usage
+        # peaks stay visible when zoomed out.
+        gvsoc.gui.Signal(self, active, name='stack_usage', path='stack_usage',
+            groups=['core'], display=gvsoc.gui.DisplayAnalog(aggregation='max'))
 
         stalls = gvsoc.gui.Signal(self, active, name='events', path="pcer_instr",         display=gvsoc.gui.DisplayPulse(), groups=['stall'])
         gvsoc.gui.Signal(self, stalls, name="cycles",        path="event_cycles",        display=gvsoc.gui.DisplayPulse(), groups=['stall'])
@@ -696,8 +848,11 @@ class RiscvCommon(st.Component):
         for id in range(0, 32):
             gvsoc.gui.Signal(self, regfile, f"x{id}", path=f"regfile/x{id}", groups=['regmap'])
 
-        # TODO this should be enabled by the build process when the runtime is using multi-threading
-        # thread = gvsoc.gui.SignalGenThreads(self, active, 'thread', 'pc', 'active_function', 'function')
+        # Flame chart of the function call stack, reconstructed from the pc / jal / jalr / irq
+        # traces. Only generated when the gui-threads parameter is set (the runtime must also be
+        # built with __GVSOC_GUI__ to emit thread_lifecycle / thread_current for per-thread groups).
+        if self.get_parameter('/gui-threads'):
+            gvsoc.gui.SignalGenThreads(self, active, 'thread', 'pc', 'active_function', 'function')
 
         return active
 
@@ -731,14 +886,15 @@ class Riscv(RiscvCommon):
         True if the core should immediately start executing instructions.
     boot_addr: int
         Boot address, i.e. address where the core will start executing instructions.
-    timed: bool
-        True if the core should model timing.
+    timed: bool | None
+        True if the core should model timing. When None (default), derived
+        from the hierarchical timing level (see ``gvrun.timing``).
     core_id : int, optional
         The core ID of the core simulated by the ISS (default: 0).
     """
     def __init__(self,
             parent: st.Component, name: str, isa: str='rv64imafdc', binaries: list=[],
-            fetch_enable: bool=False, boot_addr: int=0, timed: bool=True,
+            fetch_enable: bool=False, boot_addr: int=0, timed: bool | None=None,
             core_id: int=0, memory_start=None, memory_size=None, htif: bool=False,
             float_lib='flexfloat'):
 

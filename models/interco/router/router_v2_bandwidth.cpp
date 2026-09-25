@@ -1,0 +1,488 @@
+// SPDX-FileCopyrightText: 2026 ETH Zurich, University of Bologna and EssilorLuxottica SAS
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+// Authors: Germain Haugou (germain.haugou@gmail.com)
+
+/*
+ * Bandwidth-based address-decoding router on the io_v2 protocol.
+ *
+ * Fastest of the three router variants. Every incoming request is forwarded to the
+ * output inline — there is no scheduling of ClockEvents, no internal watermark-based
+ * queueing. Timing is reported on the request in two parts:
+ *
+ *     wait         = max(0, next_available - now)         // contention back-pressure
+ *     head_latency = wait + router_latency + mapping_latency
+ *     burst_dur    = ceil(size / bandwidth)               // bandwidth occupancy
+ *     req->inc_latency(head_latency)    // ADDITIVE across series hops
+ *     req->set_duration(burst_dur)      // MAX-combined across series hops
+ *     next_available := now + wait + burst_dur            // throughput watermark
+ *
+ * Splitting head latency (additive) from bandwidth occupancy (max-combined) is what
+ * lets two bandwidth routers in series report the bottleneck transfer time instead of
+ * summing it: the same request object carries `duration`, and each hop's set_duration()
+ * takes the max. A latency-aware initiator reads `req->get_full_latency()`
+ * (= latency + duration) and paces itself accordingly. Wall-clock stays at `now`.
+ *
+ * The only time a request is NOT forwarded inline is when the output is stalled
+ * because a previous downstream DENY has not yet been retried. In that case the
+ * request is placed in the input's queue; when `retry_muxed` fires, queued requests
+ * are drained and re-forwarded.
+ *
+ * Scope: single-mapping only (straddling mappings -> IO_RESP_INVALID).
+ *
+ * Proxy access (gvsoc_control mem_read / mem_write) is supported via the
+ * shared helper in "proxy_command.hpp": it goes through the backdoor
+ * debug-memory map (vp/debug_mem.hpp), lazily built by walking the mappings
+ * down to the terminal memories, so it completes inline even while the
+ * simulation is paused.
+ */
+
+#include <deque>
+#include <vp/vp.hpp>
+#include <vp/itf/io_v2.hpp>
+#include <vp/stats/stats.hpp>
+#include <vp/mapping_tree.hpp>
+#include <vp/signal.hpp>
+#include <vp/proxy.hpp>
+#include <interco/router_v2/router_config.hpp>
+
+#include "proxy_command.hpp"
+#include "router_v2_debug.hpp"
+
+class RouterBandwidth;
+
+class OutputPort
+{
+public:
+    OutputPort(RouterBandwidth *top, int id, std::string name);
+    void log_access(uint64_t addr, uint64_t size);
+    RouterBandwidth *top;
+    int id;
+    vp::IoMaster itf;
+    uint64_t remove_offset = 0;
+    uint64_t add_offset = 0;
+    int64_t mapping_latency = 0;
+    // Bandwidth watermark: earliest (logical) cycle at which this output can accept
+    // the next request. Advanced on every accepted forward.
+    int64_t next_available_cycle = 0;
+    // True when the downstream returned DENIED for the most recent forward; cleared
+    // by retry_muxed.
+    bool stalled = false;
+    // Per-mapping VCD traces — pre-translation addr / size of each request forwarded.
+    vp::Signal<uint64_t> current_addr;
+    vp::Signal<uint64_t> current_size;
+    int64_t last_logged_access = -1;
+    int nb_logged_access_in_same_cycle = 0;
+};
+
+struct QueuedReq
+{
+    vp::IoReq *req;
+    int output_id;
+};
+
+class InputPort
+{
+public:
+    InputPort(RouterBandwidth *top, int id, std::string name);
+    RouterBandwidth *top;
+    int id;
+    vp::IoSlave itf;
+    // Bandwidth watermark for this input. Tracks pure throughput on the input side;
+    // does not include router or mapping latency.
+    int64_t next_available_cycle = 0;
+    // Requests that were accepted by the router (GRANTED to master) but couldn't be
+    // forwarded because some output was stalled. Drained when the output retries.
+    std::deque<QueuedReq> queue;
+};
+
+struct InFlight
+{
+    InputPort *input;
+    void *saved_initiator;
+};
+
+class RouterBandwidth : public vp::Component, public vp::DebugMemIf
+{
+    friend class InputPort;
+    friend class OutputPort;
+
+public:
+    RouterBandwidth(vp::ComponentConf &conf);
+    std::string handle_command(gv::GvProxy *proxy, FILE *req_file,
+        FILE *reply_file, std::vector<std::string> args,
+        std::string cmd_req) override;
+
+    // Backdoor debug access (proxy mem_read/mem_write, GDB) — resolved
+    // through the lazily-built flat map, bypassing the timed path entirely.
+    vp::DebugMemIf *debug_mem_if() override { return this; }
+    int debug_mem_access(uint64_t addr, uint8_t *data, uint64_t size,
+        bool is_write) override;
+    void debug_mem_regions(std::vector<vp::DebugMemRegion> &regions,
+        uint64_t local_base, uint64_t window_size, uint64_t entry_base,
+        int depth) override;
+
+private:
+    static vp::IoReqStatus req_muxed(vp::Block *__this, vp::IoReq *req, int port);
+    static vp::IoRespAck resp_muxed(vp::Block *__this, vp::IoReq *req, int id);
+    static void retry_muxed(vp::Block *__this, int id, vp::IoRetryChannel);
+
+    // Flat backdoor map, built lazily on first debug access
+    vp::DebugMemMap debug_map;
+
+    // Core forward: compute and apply the latency annotation, then call out.itf.req.
+    // Returns the status to propagate to the caller. On DENIED, side-effect: output
+    // is marked stalled and the latency annotation is rolled back.
+    vp::IoReqStatus forward_inline(InputPort *in, vp::IoReq *req, OutputPort *out,
+                                    int64_t now);
+
+    // Try to drain an input's queue after its blocking output has been retried.
+    void drain_queue(InputPort *in);
+
+    InFlight *alloc_inflight();
+    void free_inflight(InFlight *ifl);
+    InFlight *inflight_free = nullptr;
+
+    RouterConfig cfg;
+    vp::MappingTree mapping_tree;
+    int error_id = -1;
+    std::vector<InputPort *> inputs;
+    std::vector<OutputPort *> entries;
+
+    vp::Trace trace;
+    vp::StatScalar stat_reads;
+    vp::StatScalar stat_writes;
+    vp::StatScalar stat_bytes_read;
+    vp::StatScalar stat_bytes_written;
+    vp::StatScalar stat_errors;
+};
+
+
+//
+// OutputPort / InputPort
+//
+
+OutputPort::OutputPort(RouterBandwidth *top, int id, std::string name)
+    : top(top), id(id),
+      itf(id, &RouterBandwidth::retry_muxed, &RouterBandwidth::resp_muxed),
+      current_addr(*top, name + "/addr", 64, vp::SignalCommon::ResetKind::HighZ),
+      current_size(*top, name + "/size", 64, vp::SignalCommon::ResetKind::HighZ)
+{
+}
+
+void OutputPort::log_access(uint64_t addr, uint64_t size)
+{
+    int64_t cycles = this->top->clock.get_cycles();
+    if (cycles > this->last_logged_access)
+        this->nb_logged_access_in_same_cycle = 0;
+
+    int64_t delay = 0;
+    if (this->nb_logged_access_in_same_cycle > 0)
+    {
+        int64_t period = this->top->clock.get_period();
+        delay = period - (period >> this->nb_logged_access_in_same_cycle);
+    }
+    this->current_addr.set_and_release(addr, 0, delay);
+    this->current_size.set_and_release(size, 0, delay);
+    this->nb_logged_access_in_same_cycle++;
+    this->last_logged_access = cycles;
+}
+
+InputPort::InputPort(RouterBandwidth *top, int id, std::string name)
+    : top(top), id(id),
+      itf(id, &RouterBandwidth::req_muxed)
+{
+}
+
+
+//
+// RouterBandwidth
+//
+
+RouterBandwidth::RouterBandwidth(vp::ComponentConf &config)
+    : vp::Component(config, this->cfg),
+      mapping_tree(&this->trace)
+{
+    this->traces.new_trace("trace", &this->trace, vp::DEBUG);
+
+    this->stats.register_stat(&this->stat_reads, "reads", "Number of read requests");
+    this->stats.register_stat(&this->stat_writes, "writes", "Number of write requests");
+    this->stats.register_stat(&this->stat_bytes_read, "bytes_read", "Total bytes read");
+    this->stats.register_stat(&this->stat_bytes_written, "bytes_written", "Total bytes written");
+    this->stats.register_stat(&this->stat_errors, "errors", "Requests with no valid mapping");
+
+    this->inputs.resize(this->cfg.nb_input_port);
+    for (int i = 0; i < this->cfg.nb_input_port; i++)
+    {
+        std::string name = i == 0 ? "input" : "input_" + std::to_string(i);
+        InputPort *in = new InputPort(this, i, name);
+        this->inputs[i] = in;
+        this->new_slave_port(name, &in->itf, this);
+    }
+
+    for (int mapping_id = 0; mapping_id < (int)this->cfg.mappings_count; mapping_id++)
+    {
+        const RouterMapping &m = this->cfg.mappings[mapping_id];
+        std::string name = m.name ? m.name : "";
+
+        this->mapping_tree.insert(mapping_id, name, m.base, m.size);
+
+        OutputPort *out = new OutputPort(this, mapping_id, name);
+        out->remove_offset = m.remove_offset;
+        out->add_offset = m.add_offset;
+        out->mapping_latency = m.latency;
+        this->entries.push_back(out);
+        this->new_master_port(name, &out->itf);
+
+        if (m.is_error) this->error_id = mapping_id;
+    }
+    this->mapping_tree.build();
+}
+
+InFlight *RouterBandwidth::alloc_inflight()
+{
+    InFlight *ifl = this->inflight_free;
+    if (ifl) { this->inflight_free = (InFlight *)ifl->saved_initiator; }
+    else     { ifl = new InFlight(); }
+    return ifl;
+}
+
+void RouterBandwidth::free_inflight(InFlight *ifl)
+{
+    // Reuse saved_initiator as freelist link — it will be overwritten on next alloc.
+    ifl->saved_initiator = (void *)this->inflight_free;
+    this->inflight_free = ifl;
+}
+
+vp::IoReqStatus RouterBandwidth::forward_inline(InputPort *in, vp::IoReq *req,
+                                                 OutputPort *out, int64_t now)
+{
+    uint64_t size = req->get_size();
+
+    // Compute bandwidth waits on both sides. A single initiator could exceed
+    // `bandwidth` by spreading traffic across multiple outputs — the per-input
+    // watermark prevents that. A single output could be oversubscribed by multiple
+    // initiators — the per-output watermark prevents that. The request must wait for
+    // whichever is later.
+    int64_t wait_in  = in->next_available_cycle  - now;  if (wait_in  < 0) wait_in  = 0;
+    int64_t wait_out = out->next_available_cycle - now;  if (wait_out < 0) wait_out = 0;
+    int64_t wait = std::max(wait_in, wait_out);
+
+    int64_t burst_duration = 0;
+    if (this->cfg.bandwidth > 0)
+    {
+        burst_duration = ((int64_t)size + this->cfg.bandwidth - 1) / this->cfg.bandwidth;
+    }
+
+    // Head latency: contention wait + router/mapping pipeline delay. This is
+    // additive across series hops (each hop adds its own), so it goes on
+    // `latency` via inc_latency(). The bandwidth occupancy (burst_duration) is
+    // reported separately via set_duration() so it combines with MAX, not sum —
+    // two series bandwidth routers streaming the same packet overlap, so the
+    // end-to-end transfer time is the bottleneck, not the total. See
+    // IoReq::get_duration() / get_full_latency().
+    int64_t head_latency = wait + this->cfg.latency + out->mapping_latency;
+
+    // Translate the address — the only mutation we do BEFORE the forward, so
+    // rollback on DENIED is one line.
+    uint64_t original_addr = req->get_addr();
+    out->log_access(original_addr, size);
+    req->set_addr(original_addr - out->remove_offset + out->add_offset);
+
+    vp::IoReqStatus st = out->itf.req(req);
+
+    if (st == vp::IO_REQ_DONE)
+    {
+        // Hot path: no InFlight, no initiator juggling, no watermark save/restore.
+        // Just annotate and advance.
+        req->inc_latency(head_latency);
+        req->set_duration(burst_duration);
+        in->next_available_cycle  = now + wait + burst_duration;
+        // Output is busy only for the bandwidth-consuming part of the
+        // transfer. router_latency + mapping_latency are pipeline delays —
+        // they delay *this* request's response (already in `logical_latency`
+        // on the annotation) but don't block the next request on the output.
+        // Without this, beat-streaming masters cascade: each beat pays
+        // router_latency again because the output watermark inflates.
+        out->next_available_cycle = now + wait + burst_duration;
+        return vp::IO_REQ_DONE;
+    }
+    if (st == vp::IO_REQ_GRANTED)
+    {
+        // Install InFlight AFTER the forward. Safe because resp_muxed can't fire
+        // until this function returns (same stack). Stashed in req->initiator
+        // (the v1 idiom) so a single load in resp_muxed retrieves it; the
+        // multi-beat / cascade safety comes from the re-install dance in
+        // resp_muxed, not from the stashing scheme itself.
+        InFlight *ifl = this->alloc_inflight();
+        ifl->input = in;
+        ifl->saved_initiator = req->initiator;
+        req->initiator = ifl;
+        req->inc_latency(head_latency);
+        req->set_duration(burst_duration);
+        in->next_available_cycle  = now + wait + burst_duration;
+        out->next_available_cycle = now + wait + burst_duration;
+        return vp::IO_REQ_GRANTED;
+    }
+    // DENIED: restore the addr, mark the output stalled. No watermark advance
+    // (nothing actually went through), no InFlight to free, no latency to undo.
+    req->set_addr(original_addr);
+    out->stalled = true;
+    return vp::IO_REQ_DENIED;
+}
+
+vp::IoReqStatus RouterBandwidth::req_muxed(vp::Block *__this, vp::IoReq *req, int port)
+{
+    RouterBandwidth *_this = (RouterBandwidth *)__this;
+    InputPort *in = _this->inputs[port];
+    uint64_t size = req->get_size();
+    int64_t now = _this->clock.get_cycles();
+
+    _this->trace.msg(vp::Trace::LEVEL_DEBUG,
+        "Req arrived (input: %d, addr: 0x%lx, size: %lu, write: %d)\n",
+        port, req->get_addr(), size, req->get_is_write() ? 1 : 0);
+
+    vp::MappingTreeEntry *mapping = _this->mapping_tree.get(
+        req->get_addr(), size, req->get_is_write());
+    bool straddles = mapping && mapping->size != 0 &&
+        req->get_addr() + size > mapping->base + mapping->size;
+    if (!mapping || mapping->id == _this->error_id || straddles ||
+        !_this->entries[mapping->id]->itf.is_bound())
+    {
+        _this->stat_errors++;
+        req->set_resp_status(vp::IO_RESP_INVALID);
+        return vp::IO_REQ_DONE;
+    }
+
+    if (req->get_is_write()) { _this->stat_writes++; _this->stat_bytes_written += size; }
+    else                     { _this->stat_reads++;  _this->stat_bytes_read    += size; }
+
+    OutputPort *out = _this->entries[mapping->id];
+
+    // If the output is currently stalled (from a prior DENY that's still pending
+    // retry), queue this request and acknowledge the master. We'll forward on retry.
+    if (out->stalled)
+    {
+        in->queue.push_back({req, (int)mapping->id});
+        return vp::IO_REQ_GRANTED;
+    }
+
+    vp::IoReqStatus st = _this->forward_inline(in, req, out, now);
+    if (st == vp::IO_REQ_DENIED)
+    {
+        // The downstream just stalled our output. forward_inline already marked the
+        // output stalled and rolled the annotation back. Absorb the request into the
+        // queue so the master sees GRANTED instead of DENIED.
+        in->queue.push_back({req, (int)mapping->id});
+        return vp::IO_REQ_GRANTED;
+    }
+    return st;
+}
+
+void RouterBandwidth::drain_queue(InputPort *in)
+{
+    while (!in->queue.empty())
+    {
+        // Copy, do NOT take a reference: pop_front() below can release the
+        // deque chunk the front element lives in, and the DENIED path still
+        // reads q.output_id to re-queue the request — a use-after-free that
+        // shows up as a garbage output_id and a permanently stalled input.
+        QueuedReq q = in->queue.front();
+        OutputPort *out = this->entries[q.output_id];
+        if (out->stalled) return;   // another DENY on this or later forward
+
+        vp::IoReq *req = q.req;
+        in->queue.pop_front();
+
+        int64_t now = this->clock.get_cycles();
+        vp::IoReqStatus st = this->forward_inline(in, req, out, now);
+
+        if (st == vp::IO_REQ_DONE)
+        {
+            // Deliver the (latency-annotated) response to the master.
+            in->itf.resp(req);
+            continue;
+        }
+        if (st == vp::IO_REQ_GRANTED)
+        {
+            // Response will come via resp_muxed.
+            continue;
+        }
+        // DENIED again — put back at head, stop draining.
+        in->queue.push_front({req, q.output_id});
+        return;
+    }
+}
+
+vp::IoRespAck RouterBandwidth::resp_muxed(vp::Block *__this, vp::IoReq *req, int /*id*/)
+{
+    RouterBandwidth *_this = (RouterBandwidth *)__this;
+    InFlight *ifl = (InFlight *)req->initiator;
+    InputPort *in = ifl->input;
+    bool burst_done = req->is_last;
+
+    // Restore the master's initiator for the duration of the upstream
+    // resp() so that any upstream resp_muxed (cascaded BW above us) finds
+    // *its* InFlight rather than ours. After the upstream call returns, we
+    // re-install ours so the next beat of a multi-beat response (asymmetric
+    // read forwarded onto a BEAT downstream that emits one resp per beat)
+    // still finds the right InFlight when resp_muxed fires again on the
+    // same req.
+    req->initiator = ifl->saved_initiator;
+
+    in->itf.resp(req);
+
+    if (burst_done)
+    {
+        _this->free_inflight(ifl);
+    }
+    else
+    {
+        req->initiator = ifl;
+    }
+    return vp::IO_RESP_ACCEPTED;
+}
+
+void RouterBandwidth::retry_muxed(vp::Block *__this, int id, vp::IoRetryChannel)
+{
+    RouterBandwidth *_this = (RouterBandwidth *)__this;
+    _this->entries[id]->stalled = false;
+    for (InputPort *in : _this->inputs)
+    {
+        if (!in->queue.empty() && in->queue.front().output_id == id)
+        {
+            _this->drain_queue(in);
+        }
+    }
+}
+
+int RouterBandwidth::debug_mem_access(uint64_t addr, uint8_t *data, uint64_t size,
+    bool is_write)
+{
+    if (!this->debug_map.is_built())
+    {
+        this->debug_map.build(this);
+    }
+    return this->debug_map.access(addr, data, size, is_write);
+}
+
+void RouterBandwidth::debug_mem_regions(std::vector<vp::DebugMemRegion> &regions,
+    uint64_t local_base, uint64_t window_size, uint64_t entry_base, int depth)
+{
+    vp_router_v2_debug::collect_regions(this->cfg, this->error_id,
+        [this](int id) -> vp::MasterPort * { return &this->entries[id]->itf; },
+        regions, local_base, window_size, entry_base, depth);
+}
+
+std::string RouterBandwidth::handle_command(gv::GvProxy *proxy, FILE *req_file,
+    FILE *reply_file, std::vector<std::string> args, std::string cmd_req)
+{
+    return vp_router_v2_proxy::handle_proxy_command(
+        proxy, req_file, reply_file, args, cmd_req, this);
+}
+
+extern "C" vp::Component *gv_new(vp::ComponentConf &config)
+{
+    return new RouterBandwidth(config);
+}

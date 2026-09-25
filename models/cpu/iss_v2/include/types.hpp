@@ -353,8 +353,42 @@ typedef struct iss_decoder_insn_s
     bool tags[ISA_NB_TAGS];
     uint8_t args_order[ISS_MAX_DECODE_ARGS];
 #if defined(CONFIG_ISS_HAS_VECTOR)
+    // The instruction carries a vm (mask-enable) bit in uim[0], i.e. when
+    // that bit is 0 it reads v0 as its mask. v0 is implicit in the encoding
+    // and so never appears in the decoded register arguments; the vector
+    // scoreboard has to add it by hand, or a masked instruction can be
+    // issued before the instruction producing its mask has committed.
+    int has_vm = 0;
     float chaining_factor = 1.0f;
     float out_chaining_factor = 1.0f;
+    // Right-shift applied to the vector unit's per-cycle element rate.
+    // Widening and narrowing instructions process elements at half the
+    // nominal SEW rate (the RTL VFU consumes the operand word over two
+    // cycles for widening — widening_upper mux — and halves nr_elem_word
+    // for narrowing), so they set this to 1.
+    int elem_rate_shift = 0;
+    // Left-shift applied to the same rate, for the instructions that consume
+    // elements FASTER than the nominal per-cycle chunk. Reductions set this
+    // to 1: the accumulator pass reads a full VRF word per cycle and feeds
+    // the (pipelined) adder tree, so the element phase costs half of what a
+    // normal computational instruction costs, and the serialization shows up
+    // as a fixed drain instead (carried by the instruction latency).
+    // Measured on the RTL with dependent vfredusum chains (e64): 30.3
+    // cycles at vl=16, 35.2 at vl=32, 43.2 at vl=64 -> 0.27 cycles/element
+    // plus a constant ~26.
+    int elem_rate_boost = 0;
+    // FPU pipeline class, used to derive the fpnew pipeline depth (the
+    // per-format register stages of the spatz timing configuration).
+    // 0: not an FPU op (or covered by its own timing model, e.g.
+    //    reductions), no pipeline latency
+    // 1: computational op (add/sub/mul/fma families) — format-dependent
+    //    depth (fp64: 2, fp32: 1, fp16/fp8: 0)
+    // 2: non-computational op (min/max/sgnj/compare/class) — 1 stage
+    // 3: conversion — 2 stages
+    int fpu_lat_class = 0;
+    // Integer computational instruction, executed by the vector unit's
+    // integer units, which can be fewer than the FPU lanes
+    int is_ipu = 0;
 #endif
 } iss_decoder_insn_t;
 
@@ -444,7 +478,17 @@ typedef struct iss_rnnext_s
 } iss_rnnext_t;
 
 #include <vp/vp.hpp>
+// The io_v2 LSU variant (CONFIG_GVSOC_ISS_LSU_V2) and the io_v2 Spatz
+// VLSU variant (CONFIG_GVSOC_ISS_VLSU_V2) both pull in the v2 IO
+// protocol everywhere in the ISS. The two headers define clashing types
+// in the ``vp::`` namespace (IoReq, IoMaster, IoSlave), so we can only
+// pull in one of them per translation unit — as soon as any v2-using
+// component is enabled we have to pick io_v2.hpp for the whole ISS.
+#if defined(CONFIG_GVSOC_ISS_LSU_V2) || defined(CONFIG_GVSOC_ISS_VLSU_V2)
+#include <vp/itf/io_v2.hpp>
+#else
 #include <vp/itf/io.hpp>
+#endif
 #include <vp/itf/wire.hpp>
 #include "vp/gdbserver/gdbserver_engine.hpp"
 

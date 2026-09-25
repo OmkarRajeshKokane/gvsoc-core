@@ -50,8 +50,15 @@ public:
     void stop() {}
     void reset(bool active);
 
+    // Generic extension hook (see lsu_v2.hpp); no-op on the v1-io LSU.
+    inline void irq_req_hook(int irq, bool irq_enabled) {}
+
     // Not implemented yet, just defined to keep compatibility with ISA files
     inline void stack_access_check(int reg, iss_addr_t addr) {}
+
+    // Latched by Regfile::memcheck_access_reg; buffer provenance transport is only
+    // implemented by the io_v2 LSU, the field just keeps the regfile code generic
+    uint32_t pending_addr_buffer_id;
 
     bool data_req_virtual(iss_insn_t *insn, iss_addr_t addr, int size, vp::IoReqOpcode opcode, bool is_signed, int reg, int reg2=0);
     bool data_req(iss_insn_t *insn, iss_addr_t addr, int size, vp::IoReqOpcode opcode, bool is_signed, int reg, int reg2);
@@ -91,8 +98,6 @@ public:
 
     bool fence();
 
-    // TODO used by syscalls, find a better to handle such accesses
-    vp::IoReq debug_req;
     vp::IoMaster data;
 
 private:

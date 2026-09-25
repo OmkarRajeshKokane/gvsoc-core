@@ -34,7 +34,7 @@ class Spatz
 public:
     Spatz(Iss &iss);
 
-    void start() {}
+    void start();
     void stop() {}
     void reset(bool active);
 

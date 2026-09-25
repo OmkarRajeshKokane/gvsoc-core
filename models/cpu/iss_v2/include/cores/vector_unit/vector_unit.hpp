@@ -22,6 +22,7 @@
 
 #include <queue>
 #include <cpu/iss_v2/include/types.hpp>
+#include <cpu/iss_v2/include/stats/insn_duration.hpp>
 #include <vp/clock/clock_event.hpp>
 #include <vp/register.hpp>
 
@@ -50,7 +51,30 @@ public:
     int8_t inreg0_index;
     int8_t inreg1_index;
     int8_t inreg2_index;
-
+    // Cycle at which the owning block really started executing this
+    // instruction (not when it was enqueued/queued). -1 until then. Used to
+    // measure per-label execution duration up to Vu::insn_end.
+    int64_t exec_start_cycle;
+    // FPU pipeline depth of this instruction (cycles between an operand
+    // word entering the unit and its result word being written), derived
+    // at issue time from the fpu_lat_class and the effective element
+    // width. Dependent instructions trail this many extra cycles behind
+    // (chaining gate) and the scoreboard entry is released this many
+    // cycles after the last chunk, without blocking the issue of the
+    // next instruction in the block.
+    int pipeline_latency;
+    // Cycle at which the last chunk of this instruction was executed
+    // (all bytes committed), -1 while still executing. Used by the
+    // chaining gate to time the consumer's trailing chunks against the
+    // producer's pipeline drain instead of its scoreboard release.
+    int64_t commit_done_cycle;
+    // Earliest cycle at which this instruction may execute its next chunk,
+    // accumulated from the pipeline drain of its (possibly already
+    // released) input dependencies. Carried on the consumer because the
+    // scoreboard entry of the producer is released before its pipeline has
+    // drained (the release also gates WAW/WAR, which the RTL frees
+    // per-word).
+    int64_t chain_release_cycle;
 };
 
 // This represents a generic HW block where vector instructions can be forwarded
@@ -94,18 +118,36 @@ private:
     // Queue of pending instructions to be processed by this block
     // The block process them in-order
     std::queue<PendingInsn *> insns;
-    // Current instruction being processed
-    PendingInsn *pending_insn;
+    // Instructions whose chunks have all been executed but which are still
+    // draining through the FPU pipeline (plus their completion latency).
+    // They do not block the issue of the next instruction; their
+    // scoreboard entry is released once their timestamp has passed.
+    std::vector<PendingInsn *> draining;
     // When the instruction is chained, this indicates the minimum cyclestamp where the instruction
     // can finished, based on operation duration.
     int64_t end_cyclestamp;
     int total_size;
     int vstart;
     int vend;
+    // Which unit class (0: FPU, 1: IPU) executed the previous instruction,
+    // used to model the datapath switch drain. -1 until the first one.
+    int last_unit_class;
+    // Cycle until which each unit class drains the pipeline of its last
+    // instruction. A datapath switch must wait for the departing unit to
+    // drain before the incoming instruction can start.
+    int64_t unit_busy_until[2];
+    // Instruction already charged with the switch drain, so that it is
+    // applied only once
+    PendingInsn *switch_charged;
 };
 
 class VuLsuPendingInsn
 {
+public:
+    // Cycle at which the instruction entered the block queue. Used to
+    // discount the dispatch latency already absorbed while waiting
+    // behind the previous instruction's request stream.
+    int64_t enqueue_cycle = 0;
 public:
     PendingInsn *insn;
     // Number of pending bursts. This is used to detect when the instruction is fully done.
@@ -115,6 +157,213 @@ public:
 };
 
 #if defined(CONFIG_GVSOC_ISS_USE_SPATZ)
+
+#if defined(CONFIG_GVSOC_ISS_VLSU_V2)
+
+// Largest number of bytes a single VLSU request can carry. A request never
+// spans more than one lane word, and the widest lane the model supports is
+// 8 bytes; the per-request masking buffers are sized from this.
+#define VLSU_MAX_REQ_SIZE 8
+
+
+// Block processing load/store vector instructions, io_v2 variant.
+//
+// Functionally mirrors the v1 ``VuLsu`` (same FSM, same instruction handling)
+// but talks to the TCDM through master ports built on ``vp/itf/io_v2.hpp``:
+// status codes are ``IO_REQ_DONE``/``GRANTED``/``DENIED``, error reporting
+// rides on the response status (``IO_RESP_OK``/``IO_RESP_INVALID``), and the
+// retry/resp callbacks are mandatory (passed at port construction time).
+//
+// All three downstream forms are supported, so the VLSU ports can face a
+// deny/retry arbiter such as ``interco.log_ico_v2``:
+//   - DONE: completion is scheduled ``get_full_latency()`` cycles later
+//     through the delayed-bursts priority queue.
+//   - GRANTED: completion arrives through the resp() callback.
+//   - DENIED: the request is parked on its port and re-issued synchronously
+//     inside the retry() callback (mandatory io_v2 contract — the log ico
+//     keeps its accept window open only for the duration of the retry call).
+//     Only the denied port stalls; the other ports keep streaming.
+class VuLsu : public VuBlock
+{
+public:
+
+    void reset(bool active) override;
+    void start() override;
+    VuLsu(Vu &vu, Iss &iss);
+    bool is_full() override { return this->nb_pending_insn.get() == VuLsu::queue_size; }
+    void enqueue_insn(PendingInsn *pending_insn) override;
+    void isa_init() override;
+
+private:
+    // Handler for internal FSM
+    static void fsm_handler(vp::Block *__this, vp::ClockEvent *event);
+    static void handle_insn_load(VuLsu *vlsu, iss_insn_t *insn);
+    static void handle_insn_store(VuLsu *vlsu, iss_insn_t *insn);
+    static void handle_insn_load_strided(VuLsu *vlsu, iss_insn_t *insn);
+    static void handle_insn_store_strided(VuLsu *vlsu, iss_insn_t *insn);
+    static void handle_insn_load_indexed(VuLsu *vlsu, iss_insn_t *insn);
+    static void handle_insn_store_indexed(VuLsu *vlsu, iss_insn_t *insn);
+
+    void handle_access(iss_insn_t *insn, bool is_write, int reg, bool do_stride=false, iss_reg_t stride=0, int reg_indexed=-1);
+
+    // io_v2 master callbacks — pure ready/valid signal (no request) on retry,
+    // and response notification on resp.
+    static void port_retry_muxed(vp::Block *__this, int id, vp::IoRetryChannel);
+    static vp::IoRespAck port_resp_muxed(vp::Block *__this, vp::IoReq *req, int id);
+
+    // Called when a request has been accepted with DONE: either complete it
+    // now or push it to the delayed-bursts queue for get_full_latency()
+    // cycles.
+    void handle_done(vp::IoReq *req);
+    // Terminate one burst: commit its elements to the VRF (chaining) and
+    // retire it from the per-port in-order ROB.
+    void burst_done(vp::IoReq *req);
+
+    // Number of instruction that can be enqueued at the same time
+    static constexpr int queue_size = 4;
+
+    Vu &vu;
+    vp::Trace trace;
+    vp::Trace event_active;
+    std::vector<vp::Trace> event_addr;
+    std::vector<vp::Trace> event_size;
+    std::vector<vp::Trace> event_is_write;
+    vp::Trace event_queue;
+    vp::Trace event_pc;
+    vp::Event event_label;
+    vp::ClockEvent fsm_event;
+    std::vector<VuLsuPendingInsn> insns;
+    iss_addr_t pending_addr;
+    iss_addr_t pending_size;
+    bool pending_is_write;
+    uint8_t *pending_velem;
+    int pending_vreg;
+    int insn_first;
+    int insn_first_waiting;
+    int insn_last;
+    vp::Register<uint8_t> nb_pending_insn;
+    int nb_waiting_insn;
+    // Ports to the TCDM, used by VLSU for vector load and store operations.
+    // io_v2 master ports require retry/resp callbacks at construction time;
+    // we use the muxed variants so a single pair of callbacks dispatches by
+    // port id.
+    std::vector<vp::IoMaster> ports;
+    // Queues of requests. Each port has its own queue to model limited
+    // outstanding requests.
+    std::vector<vp::Queue *> req_queues;
+    // Whole list of requests for all ports
+    std::vector<vp::IoReq> requests;
+    // Per-port request denied by the downstream and waiting for its retry()
+    // signal. A port with a parked request issues nothing else.
+    std::vector<vp::IoReq *> denied_reqs;
+    int nb_ports;
+    iss_reg_t stride;
+    bool strided;
+    // Whether a unit-stride access is issued one element per request because
+    // its base address is not aligned on the lane width
+    bool single_element;
+    // Single-element mode request sequencing. Like on RTL, each port owns
+    // full lane-width words of the vector so that two elements sharing a
+    // word are issued on the same port on consecutive cycles, instead of
+    // conflicting on the same memory bank in the same cycle.
+    iss_addr_t se_base_addr;
+    uint8_t *se_base_velem;
+    int se_base_vstart;
+    int se_nb_elems;
+    std::vector<int> se_port_count;
+    int elem_size;
+    int reg_indexed;
+    int pending_elem;
+    int inst_elem_size;
+    int64_t op_timestamp;
+    bool prev_is_write;
+    // Whether the previous VLSU instruction was an indexed access, used to
+    // model the index-fetch startup of back-to-back indexed streams
+    bool prev_is_indexed;
+    bool started;
+    int vstart;
+    // The on-going access is masked by v0 (its vm bit is clear). On RTL the
+    // mask never suppresses a memory request -- it is applied as a byte
+    // strobe on stores (mem_req_strb) and as a write byte enable on the VRF
+    // write-back of loads (vrf_req_d.wbe), see spatz_vlsu.sv. The model does
+    // the same, so masking costs no cycles and the request stream is
+    // identical to the unmasked one.
+    bool masked;
+
+
+    // Ongoing instruction
+    int insn_ongoing;
+
+    // Bursts which have been handled synchronously with a delay. They are
+    // held here until their delay has elapsed.
+    struct DelayedBurst
+    {
+        vp::IoReq *req;
+        uint64_t timestamp;
+    };
+
+    struct DelayedBurstCompare
+    {
+        bool operator()(const DelayedBurst &a, const DelayedBurst &b) const
+        {
+            return a.timestamp > b.timestamp;
+        }
+    };
+
+    std::priority_queue<DelayedBurst, std::vector<DelayedBurst>, DelayedBurstCompare> delayed_bursts;
+
+    // Per-port in-order reorder buffer entry. The request keeps a pointer to
+    // its entry in ``initiator`` (io_v2 has no arg stack).
+    struct VlsuRobEntry
+    {
+        // Port and id
+        int port = 0;
+        int rob_id = 0;
+
+        // If the entry is allocated to a request
+        bool allocated = false;
+
+        // If the response is valid
+        bool valid = false;
+
+        // Request itself
+        vp::IoReq *req = nullptr;
+
+        // Instruction slot which issued the request
+        VuLsuPendingInsn *slot = nullptr;
+
+        // Vector register
+        int vreg = 0;
+
+        int elem_size = 0;
+        int vstart = 0;
+        int size = 0;
+
+        // Masked access support. A masked LOAD lands in `scratch` instead of
+        // straight in the vector register file, and the active elements are
+        // merged into `vrf_dest` when the entry retires, so the inactive ones
+        // keep their previous value (mask-undisturbed). A masked STORE points
+        // the request's byte strobe at `strb`, so the target commits only the
+        // active elements. `masked` is false for the common unmasked case, in
+        // which neither buffer is touched.
+        bool masked = false;
+        uint8_t *vrf_dest = nullptr;
+        // Sized for one request, which never exceeds the lane width.
+        uint8_t scratch[VLSU_MAX_REQ_SIZE];
+        uint8_t strb[VLSU_MAX_REQ_SIZE];
+    };
+
+    // Reorder buffer
+    std::vector<std::vector<VlsuRobEntry>> rob;
+    // Next available entry in the ROB for each port
+    std::vector<int> rob_next;
+    // The first entry in the ROB which is waiting for response for each port
+    std::vector<int> rob_first;
+    // Number of allocated entries in the ROB for each port
+    std::vector<int> rob_count;
+};
+
+#else
 
 // Block processing load/store vector instructions
 class VuLsu : public VuBlock
@@ -151,6 +400,11 @@ private:
     static void handle_insn_store_indexed(VuLsu *vlsu, iss_insn_t *insn);
 
     void handle_access(iss_insn_t *insn, bool is_write, int reg, bool do_stride=false, iss_reg_t stride=0, int reg_indexed=-1);
+
+    // Handler for asynchronous burst grants
+    static void data_grant(vp::Block *__this, vp::IoReq *req);
+    // Handler for asynchronous burst responses
+    static void data_response(vp::Block *__this, vp::IoReq *req);
 
     // Number of instruction that can be enqueued at the same time
     static constexpr int queue_size = 4;
@@ -207,15 +461,96 @@ private:
     int nb_ports;
     iss_reg_t stride;
     bool strided;
+    // Whether a unit-stride access is issued one element per request because
+    // its base address is not aligned on the lane width
+    bool single_element;
+    // Single-element mode request sequencing. Like on RTL, each port owns
+    // full lane-width words of the vector so that two elements sharing a
+    // word are issued on the same port on consecutive cycles, instead of
+    // conflicting on the same memory bank in the same cycle.
+    iss_addr_t se_base_addr;
+    uint8_t *se_base_velem;
+    int se_base_vstart;
+    int se_nb_elems;
+    std::vector<int> se_port_count;
     int elem_size;
     int reg_indexed;
     int pending_elem;
     int inst_elem_size;
     int64_t op_timestamp;
     bool prev_is_write;
+    // Whether the previous VLSU instruction was an indexed access, used to
+    // model the index-fetch startup of back-to-back indexed streams
+    bool prev_is_indexed;
     bool started;
     int vstart;
+    // Instruction currently active in the VLSU. pending_insn->timestamp is reused across phases:
+    // 1. as an enqueue-cycle guard, 2. as the request issuing start time after instruction latency, 
+    // and 3. for memory-response/retirement timing. Keeping this index separate from insn_first_waiting 
+    // makes the phase explicit and prevents queued instructions from consuming their instruction latency 
+    // before they become active.
+    int insn_ongoing;
+    
+    // True if one burst was not granted. Once it is true, the block can not send any burst
+    // anymore until the last one is granted
+    bool stalled;
+
+    // Bursts which have been handled synchronously with a delay. There are hold here until their
+    // delay has elapsed
+    struct DelayedBurst
+    {
+        vp::IoReq *req;
+        uint64_t timestamp;
+    };
+
+    struct DelayedBurstCompare
+    {
+        bool operator()(const DelayedBurst &a, const DelayedBurst &b) const
+        {
+            return a.timestamp > b.timestamp;
+        }
+    };
+
+    std::priority_queue<DelayedBurst, std::vector<DelayedBurst>, DelayedBurstCompare> delayed_bursts;
+
+    // Reorder Buffer for mempool configuration
+    struct VlsuRobEntry
+    {
+        // Port and id
+        int port = 0;
+        int rob_id = 0;
+
+        // If the entry is allocated to a request
+        bool allocated = false;
+
+        // If the response is valid
+        bool valid = false;
+
+        // Request itself
+        vp::IoReq *req = nullptr;
+
+        // Instruction slot issued the request
+        VuLsuPendingInsn *slot = nullptr;
+
+        // Vector register
+        int vreg = 0;
+
+        int elem_size = 0;
+        int vstart = 0;
+        int size = 0;
+    };
+
+    // Reorder buffer
+    std::vector<std::vector<VlsuRobEntry>> rob;
+    // Next available entry in the ROB for each port
+    std::vector<int> rob_next;
+    // The first entry in the ROB which is waiting for response for each port
+    std::vector<int> rob_first;
+    // Number of allocated entries in the ROB for each port
+    std::vector<int> rob_count;
 };
+
+#endif // CONFIG_GVSOC_ISS_VLSU_V2
 
 #else
 
@@ -303,6 +638,17 @@ private:
     int nb_waiting_insn;
     int elem_size;
     int vstart;
+
+    // Instruction currently active in the VLSU. It is either waiting for its instruction latency to elapse 
+    // or already actively issuing memory requests. This is kept separate from insn_first_waiting for the following reason. 
+    // pending_insn->timestamp has multiple purposes:
+    // 1. At the instruction enqueue time, it is set to (enqueue cycle + 1) to avoid starting to execute the instruction immediately in the same cycle;
+    // 2. At the instruction execution start, it is set to (current cycle + instruction latency), to prevent the instruction from issuing memory requests before its instruction latency elapses;
+    // 3. During the instruction execution, it is used to track the synchronous memory access latency (current cycle + request latency) and instruction retirement time.
+    // In order to distinguish between the first two cases in the FSM, and ensure that instruction latency is only modeled once,
+    // we seperate index insn_ongoing (with timestamp of purpose 2 or 3) from insn_first_waiting (with timestamp of purpose 1).
+    // This also prevents the younger instructions waiting in the queue from consuming its latency while the older instruction is still active.
+    int insn_ongoing;
 };
 
 #endif
@@ -354,6 +700,9 @@ public:
     Iss &iss;
     // Number of <lane_width> bits lanes in vu.
     int nb_lanes;
+    // Number of <lane_width> bits integer units in vu. Integer computational
+    // instructions are processed at this rate instead of the lane one.
+    int nb_ipus;
     // Width in bits of one lane
     int lane_width;
 
@@ -383,8 +732,8 @@ private:
     inline void free_id(int id);
 
     // Size of the queue holding pending instructions. Once full, vu can not accept instructions
-    // from CVA6 anymore
-    static constexpr int queue_size = 8;
+    // from CVA6 anymore. Spatz can handle 4 instructions at a time.
+    static constexpr int queue_size = 4;
 
     // Event for active state
     vp::Trace event_active;
@@ -416,10 +765,23 @@ private:
 
     std::queue<PendingInsn *> stalled_insns;
     std::vector<uint64_t> insns_in_deps;
+    // Writers AND readers of this instruction's destination registers: both
+    // write-after-write and write-after-read block until the dependency
+    // retires, through the same gate in Vu::insn_ready. See the note there
+    // about the RTL chaining this does not model.
     std::vector<uint64_t> insns_out_deps;
     uint64_t writing_insns[32];
     uint64_t reading_insns[32];
     int insn_latency;
+
+#ifdef CONFIG_GVSOC_STATS_ACTIVE
+    // Per-label execution-duration statistics for vector instructions, dumped
+    // under the "vinsn_duration" group. A vector instruction waits in the Vu
+    // queue and in its block before really executing, so duration is measured
+    // from the block's real start (exec_start_cycle) to Vu::insn_end.
+    bool stats_enabled = false;
+    InsnDurationStats insn_durations;
+#endif
 };
 
 inline int Vu::alloc_id()

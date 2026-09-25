@@ -63,7 +63,11 @@ void Regfile::reset(bool active)
 
 #ifdef CONFIG_GVSOC_ISS_SCOREBOARD
         // Initialize the scoreboard so that registers can be read by default.
-        for (int i = 0; i < ISS_NB_REGS; i++)
+        // The timestamp array has ISS_NB_REGS+1 entries: the extra slot is the
+        // scratch destination used by instructions writing to x0 and must be
+        // cleared too, otherwise scoreboard_reg_check() reads a garbage timestamp
+        // and stalls the core for a huge number of cycles.
+        for (int i = 0; i < ISS_NB_REGS + 1; i++)
         {
             this->scoreboard_reg_timestamp[i] = 0;
         }
@@ -75,16 +79,24 @@ void Regfile::reset(bool active)
 #endif
 #endif
 
-        this->memcheck_reg_fault = false;
-
-        // Mark all registers as invalid after reset
-        for (int i = 1; i < ISS_NB_REGS; i++)
-        {
-            this->regs_memcheck[i] = 0;
-        }
-
-        // Except x0 which is always valid
-        this->regs_memcheck[0] = -1;
-        this->regs_memcheck[ISS_NB_REGS] = -1;
+        this->memcheck_reset();
     }
+}
+
+
+// Arm the memory checker: every register uninitialized again, except x0 which is
+// always valid. Called at core reset, and again when the runtime declares the
+// application is starting (semihosting 0x11B), so that what the boot ROM left
+// behind is not taken for initialized data.
+void Regfile::memcheck_reset()
+{
+    this->memcheck_reg_fault = false;
+
+    for (int i = 1; i < ISS_NB_REGS; i++)
+    {
+        this->regs_memcheck[i] = 0;
+    }
+
+    this->regs_memcheck[0] = -1;
+    this->regs_memcheck[ISS_NB_REGS] = -1;
 }

@@ -273,10 +273,19 @@ void Syscalls::handle_riscv_ebreak()
                 return;
             }
 
-            if (write(args[0], (void *)(long)buffer, iter_size) != iter_size)
-                break;
+            if (args[0] == 1 || args[0] == 2)
+            {
+                // stdout / stderr: route through the always-on console channel so the output can
+                // also be captured by the GUI, tagged with time + core path.
+                this->iss.top.stdout_write((char *)buffer, iter_size);
+            }
+            else
+            {
+                if (write(args[0], (void *)(long)buffer, iter_size) != iter_size)
+                    break;
 
-            fsync(args[0]);
+                fsync(args[0]);
+            }
 
             size -= iter_size;
             addr += iter_size;
@@ -342,7 +351,8 @@ void Syscalls::handle_riscv_ebreak()
             this->iss.regfile.regs[10] = -1;
             return;
         }
-        putchar(args[0]);
+        char c = (char)args[0];
+        this->iss.top.stdout_write(&c, 1);
         break;
     }
 
@@ -758,6 +768,16 @@ void Syscalls::handle_riscv_ebreak()
           this->iss.regfile.regs[12],
           this->iss.regfile.regs[13]);
 
+        break;
+    }
+
+    // The runtime declares the application is starting: re-arm the register
+    // shadow, so that what ran before -- a boot ROM initializing every register,
+    // then spilled onto the application stack -- does not pass for initialized
+    // data. Memory already written stays initialized, which is correct.
+    case 0x11B:
+    {
+        this->iss.regfile.memcheck_reset();
         break;
     }
 

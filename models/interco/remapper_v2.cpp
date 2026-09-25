@@ -1,0 +1,231 @@
+// SPDX-FileCopyrightText: 2026 ETH Zurich, University of Bologna and EssilorLuxottica SAS
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+// Authors: Germain Haugou (germain.haugou@gmail.com)
+//
+// Window-based address remapper on the io_v2 protocol.
+//
+// Port of remapper.cpp to io_v2. Functionally unchanged: requests whose
+// address falls in ``[base, base + size)`` have their address rewritten to
+// ``target_base + (addr - base)``; all other requests are forwarded with
+// the address untouched. No data is buffered, no latency is added.
+//
+// What changed vs v1:
+//   - Single-master slave port; replies travel back via
+//     ``input_itf.resp(req)`` rather than v1's ``req->resp_port`` lookup.
+//   - Status codes are ``IO_REQ_DONE`` / ``IO_REQ_GRANTED`` / ``IO_REQ_DENIED``.
+//   - AXI-like deny/retry handshake. When the downstream DENIEs we
+//     restore the request's original address (so the master's re-send
+//     looks exactly like the first attempt) and set ``input_needs_retry``.
+//     The flag is cleared when the output fires ``retry()``, at which
+//     point we propagate ``retry()`` on the input.
+//
+// Timing model: big-packet, zero-latency. Whatever latency the downstream
+// reports (via ``req->latency`` on a sync ``IO_REQ_DONE`` or via when it
+// schedules ``resp()`` on an async path) is observed directly by the
+// upstream master — the remapper adds no cycle.
+
+#include <algorithm>
+#include <vp/vp.hpp>
+#include <vp/itf/io_v2.hpp>
+#include <vp/debug_mem.hpp>
+#include <interco/remapper_v2/remapper_config.hpp>
+
+class Remapper : public vp::Component, public vp::DebugMemIf
+{
+public:
+    Remapper(vp::ComponentConf &conf);
+    void reset(bool active) override;
+
+    // Backdoor debug access (vp/debug_mem.hpp): recurse into the output with
+    // the same window translation as the timed path, so a debug entry above
+    // the remapper sees the remapped view (aliases included).
+    vp::DebugMemIf *debug_mem_if() override { return this; }
+    int debug_mem_access(uint64_t addr, uint8_t *data, uint64_t size,
+        bool is_write) override;
+    void debug_mem_regions(std::vector<vp::DebugMemRegion> &regions,
+        uint64_t local_base, uint64_t window_size, uint64_t entry_base,
+        int depth) override;
+
+    RemapperConfig cfg;
+
+private:
+    static vp::IoReqStatus input_req(vp::Block *__this, vp::IoReq *req);
+    static vp::IoRespAck   output_resp(vp::Block *__this, vp::IoReq *req);
+    static void            output_retry(vp::Block *__this, vp::IoRetryChannel);
+
+    vp::Trace trace;
+
+    vp::IoSlave  input_itf{&Remapper::input_req};
+    vp::IoMaster output_itf{&Remapper::output_retry, &Remapper::output_resp};
+
+    // True when we have returned IO_REQ_DENIED upstream and owe an
+    // ``input_itf.retry()`` as soon as the downstream recovers. At most one
+    // such pending retry can be outstanding because the single upstream
+    // master port can only hold one denied request.
+    bool input_needs_retry = false;
+
+    // Flat backdoor map of this component's address space, lazily built on
+    // first debug access when the remapper is itself the debug entry point.
+    vp::DebugMemMap debug_map;
+};
+
+
+Remapper::Remapper(vp::ComponentConf &config)
+    : vp::Component(config, this->cfg)
+{
+    this->traces.new_trace("trace", &this->trace, vp::DEBUG);
+
+    this->new_slave_port("input",   &this->input_itf);
+    this->new_master_port("output", &this->output_itf);
+}
+
+void Remapper::reset(bool active)
+{
+    if (active)
+    {
+        this->input_needs_retry = false;
+    }
+}
+
+
+vp::IoReqStatus Remapper::input_req(vp::Block *__this, vp::IoReq *req)
+{
+    Remapper *_this = (Remapper *)__this;
+
+    uint64_t addr = req->get_addr();
+    uint64_t base = (uint64_t)_this->cfg.base;
+    uint64_t size = (uint64_t)_this->cfg.size;
+
+    // The window test is deliberately half-open: `base <= addr < base + size`.
+    // With size == 0 no address is ever "inside", which is the expected
+    // behaviour for a disabled remap.
+    bool in_window = (size > 0) && (addr >= base) && (addr < base + size);
+
+    _this->trace.msg(vp::Trace::LEVEL_DEBUG,
+        "IO req (req: %p, addr: 0x%llx, size: 0x%llx, write: %d, in_window: %d)\n",
+        req, (unsigned long long)addr,
+        (unsigned long long)req->get_size(),
+        req->get_is_write() ? 1 : 0, in_window ? 1 : 0);
+
+    if (in_window)
+    {
+        req->set_addr(addr - base + (uint64_t)_this->cfg.target_base);
+    }
+
+    vp::IoReqStatus st = _this->output_itf.req(req);
+
+    if (st == vp::IO_REQ_DENIED)
+    {
+        // Nothing went through — restore the original address so that when
+        // the upstream master retries, its request looks byte-for-byte like
+        // the first attempt. Mark that we owe an upstream retry once our
+        // own output port retries.
+        if (in_window)
+        {
+            req->set_addr(addr);
+        }
+        _this->input_needs_retry = true;
+    }
+    return st;
+}
+
+
+vp::IoRespAck Remapper::output_resp(vp::Block *__this, vp::IoReq *req)
+{
+    Remapper *_this = (Remapper *)__this;
+    // Stateless forward. The request object still carries whatever address
+    // the downstream saw (rewritten if we mapped it); we do not restore it
+    // on DONE/RESP because the upstream master typically does not re-read
+    // req->addr after completion.
+    _this->input_itf.resp(req);
+    return vp::IO_RESP_ACCEPTED;
+}
+
+
+void Remapper::output_retry(vp::Block *__this, vp::IoRetryChannel)
+{
+    Remapper *_this = (Remapper *)__this;
+    if (_this->input_needs_retry)
+    {
+        _this->input_needs_retry = false;
+        _this->input_itf.retry();
+    }
+}
+
+
+int Remapper::debug_mem_access(uint64_t addr, uint8_t *data, uint64_t size,
+    bool is_write)
+{
+    if (!this->debug_map.is_built())
+    {
+        this->debug_map.build(this);
+    }
+    return this->debug_map.access(addr, data, size, is_write);
+}
+
+void Remapper::debug_mem_regions(std::vector<vp::DebugMemRegion> &regions,
+    uint64_t local_base, uint64_t window_size, uint64_t entry_base, int depth)
+{
+    if (depth >= vp::DebugMemIf::MAX_DEPTH)
+    {
+        return;
+    }
+
+    std::vector<vp::SlavePort *> finals = this->output_itf.get_final_ports();
+    if (finals.empty() || finals[0]->get_owner() == nullptr)
+    {
+        return;
+    }
+    vp::DebugMemIf *child = finals[0]->get_owner()->debug_mem_if();
+    if (child == nullptr)
+    {
+        return;
+    }
+
+    // Same translation as the timed path: the remap window recurses with the
+    // address rewritten to the target window, the parts of the requested
+    // window below and above it recurse with the address untouched.
+    uint64_t base = (uint64_t)this->cfg.base;
+    uint64_t size = (uint64_t)this->cfg.size;
+    uint64_t win_end = local_base + window_size < local_base ?
+        UINT64_MAX : local_base + window_size;
+
+    uint64_t map_base = base;
+    uint64_t map_end = (size > 0) ? base + size : base;
+
+    // Identity segment below the remap window
+    if (local_base < map_base)
+    {
+        uint64_t seg_end = std::min(win_end, map_base);
+        child->debug_mem_regions(regions, local_base, seg_end - local_base,
+            entry_base, depth + 1);
+    }
+
+    // Remapped segment
+    uint64_t i_base = std::max(local_base, map_base);
+    uint64_t i_end = std::min(win_end, map_end);
+    if (i_base < i_end)
+    {
+        child->debug_mem_regions(regions,
+            i_base - base + (uint64_t)this->cfg.target_base,
+            i_end - i_base,
+            entry_base + (i_base - local_base),
+            depth + 1);
+    }
+
+    // Identity segment above the remap window
+    if (win_end > map_end)
+    {
+        uint64_t seg_base = std::max(local_base, map_end);
+        child->debug_mem_regions(regions, seg_base, win_end - seg_base,
+            entry_base + (seg_base - local_base), depth + 1);
+    }
+}
+
+
+extern "C" vp::Component *gv_new(vp::ComponentConf &config)
+{
+    return new Remapper(config);
+}

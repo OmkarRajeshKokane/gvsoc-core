@@ -15,11 +15,30 @@
 #
 
 
-from dataclasses import dataclass
-from gvrun.config import Config, cfg_field
+from typing import ClassVar
+
+from config_tree import Config, cfg_field
+from vp.power_config import PowerSourceConfig
 
 
-@dataclass(repr=False)
+class RiscvPowerConfig(Config):
+    """Named core power sources, typically filled from the core power model
+    YAML with vp.power_config.apply_power_yaml. Untouched sources stay
+    inert."""
+
+    _defer_parent_init: ClassVar[bool] = True
+
+    stall_first: PowerSourceConfig = cfg_field(default_factory=PowerSourceConfig, desc=(
+        "Energy of the first stall cycle of an instruction"
+    ))
+    stall_next: PowerSourceConfig = cfg_field(default_factory=PowerSourceConfig, desc=(
+        "Energy of each following stall cycle"
+    ))
+    background: PowerSourceConfig = cfg_field(default_factory=PowerSourceConfig, desc=(
+        "Core background power (dynamic + leakage)"
+    ))
+
+
 class RiscvConfig(Config):
     isa: str = cfg_field(default='rv32imafdc', dump=True, desc=(
         "ISA string of the core"
@@ -46,4 +65,17 @@ class RiscvConfig(Config):
     ))
     mmu: bool = cfg_field(default=False, dump=True, desc=(
         "True if the ISS should include the MMU."
+    ))
+    lsu_hold_on_async: bool = cfg_field(default=False, dump=True, desc=(
+        "True if a data access answered asynchronously holds the core until its response "
+        "(the response stands for the grant of a core which is only granted such an access "
+        "when it completes, like a PULP core behind its demux for anything but the TCDM)."
+    ))
+    power_insn_groups: list[PowerSourceConfig] = cfg_field(default_factory=list, init=False, desc=(
+        "Per-instruction-group dynamic energy tables; the list index matches the isa "
+        "power group set with set_power_group. Empty = per-instruction power off."
+    ))
+    power: RiscvPowerConfig = cfg_field(default_factory=RiscvPowerConfig,
+        init=False, desc=(
+        "Named core power sources (stall_first, stall_next, background)."
     ))

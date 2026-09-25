@@ -87,6 +87,16 @@ void ExecInOrder::reset(bool active)
         this->first_task = NULL;
         this->instr_disabled = false;
 
+#ifdef CONFIG_GVSOC_ISS_EXEC_INORDER_COMMIT
+        this->queue_head = NULL;
+        this->queue_tail = NULL;
+#endif
+#ifdef CONFIG_GVSOC_ISS_REGFILE_SCOREBOARD
+        this->unblock_slot_valid = false;
+        this->unblock_task_pending = false;
+        this->unblock_task.callback = &ExecInOrder::task_unblock_handle;
+#endif
+
         // Always increase the stall when reset is asserted since stall count is set to 0
         // and we need to prevent the core from fetching instructions
         this->retain_inc();
@@ -195,6 +205,11 @@ void ExecInOrder::exec_instr(vp::Block *__this, vp::ClockEvent *event)
             return;
         }
 
+        // Hardware-loop redirect: if pc matches a registered loop end
+        // and its counter > 0, decrement and redirect to the loop start.
+        // The default HwloopEmpty variant inlines to a no-op.
+        next_pc = iss->hwloop.check(pc, next_pc);
+
         iss->exec.current_insn = next_pc;
 
         if (!iss->exec.is_insn_hold)
@@ -205,6 +220,23 @@ void ExecInOrder::exec_instr(vp::Block *__this, vp::ClockEvent *event)
         iss->exec.is_insn_hold = false;
 
         iss->exec.asm_trace_event.event_string(insn->desc->label, false);
+
+        // Per-core retire hook (Ri5kyEvents uses it to track prev_dest_reg
+        // so the next jalr can detect the jr_stall hazard). Skipping this
+        // in the fast path would leave the dependency invisible to the
+        // event hooks. The default Events implementation is a no-op so
+        // cores without a retire hook pay nothing.
+        iss->timing.event_retire_account(insn);
+
+        // Per-instruction extra latency, set at decoder time by a per-core
+        // setup pass (see e.g. Ri5ky::start setting latency=4 on the "mulh"
+        // tag). Each core decides what the value means via its
+        // event_insn_latency_account override — unconditional stall,
+        // scoreboard timestamp, resource serialisation, etc.
+        if (insn->latency > 0)
+        {
+            iss->timing.event_insn_latency_account(insn, insn->latency);
+        }
 
         // Since power instruction information is filled when the instruction is decoded,
         // make sure we account it only after the instruction is executed
@@ -247,7 +279,7 @@ void ExecInOrder::exec_instr_check_all(vp::Block *__this, vp::ClockEvent *event)
     // if HW counters are disabled as they are checked with the slow handler
     if (_this->can_switch_to_fast_mode())
     {
-        _this->instr_event.set_callback(&ExecInOrder::exec_instr);
+        _this->switch_to_fast_mode();
     }
 
     if (!_this->skip_irq_check)
@@ -282,6 +314,19 @@ void ExecInOrder::exec_instr_check_all(vp::Block *__this, vp::ClockEvent *event)
 
         if (iss->regfile.scoreboard_insn_check(insn)) return;
 
+#ifdef CONFIG_GVSOC_STATS_ACTIVE
+        // Open the per-label duration window once the instruction's input
+        // dependencies are ready (after the scoreboard check, which returns
+        // above while an input reg is still invalid). This excludes load-use /
+        // RAW waits: the instruction effectively starts when its inputs are
+        // ready. The icache miss already elapsed during the fetch (before this
+        // point) so it stays excluded, and the stall_cycles baseline still
+        // cancels a synchronous icache-miss stall. Opens once: the instruction's
+        // own data-access retries (is_insn_stalled) re-enter here but keep the
+        // original anchor, so that wait is counted.
+        _this->iss.timing.dur_window_open(insn, _this->stall_cycles);
+#endif
+
         iss->regfile.scoreboard_insn_start(insn);
 
         if (iss->trace.insn_trace.get_active())
@@ -300,8 +345,39 @@ void ExecInOrder::exec_instr_check_all(vp::Block *__this, vp::ClockEvent *event)
             return;
         }
 
+        // Hardware-loop redirect: see fast-path equivalent above.
+        next_pc = iss->hwloop.check(pc, next_pc);
+
         _this->current_insn = next_pc;
 
+#ifdef CONFIG_GVSOC_ISS_EXEC_INORDER_COMMIT
+        if (!_this->is_insn_hold && _this->queue_head != NULL)
+        {
+            // Sync follower behind one or more held insns: park the
+            // trace + entry on the FIFO tail with ready=true so it
+            // commits in dispatch order, after the held head(s). The
+            // follower has already executed synchronously, so its
+            // result is in the regfile — clearing the scoreboard now
+            // lets dependents dispatch without waiting for the head
+            // to retire (and follower's commit only defers the trace
+            // dump, not the writeback).
+            InsnEntry *entry = _this->get_entry();
+            entry->addr = insn->addr;
+            entry->opcode = insn->opcode;
+#ifdef VP_TRACE_ACTIVE
+            if (iss->trace.insn_trace.get_active())
+            {
+                entry->trace = iss->trace.detach_entry();
+            }
+#endif
+            entry->ready = true;
+            entry->next = NULL;
+            _this->queue_tail->next = entry;
+            _this->queue_tail = entry;
+            iss->regfile.scoreboard_insn_end(insn);
+        }
+        else
+#endif
         if (!_this->is_insn_hold)
         {
             iss->regfile.scoreboard_insn_end(insn);
@@ -318,6 +394,25 @@ void ExecInOrder::exec_instr_check_all(vp::Block *__this, vp::ClockEvent *event)
         _this->asm_trace_event.event_string(insn->desc->label, false);
 
         _this->iss.timing.event_instr_account();
+        // Per-core hook: lets Ri5kyEvents track the previous insn's
+        // destination register so a following jalr can detect the
+        // jr_stall hazard. Default in the base Events class is a no-op.
+        _this->iss.timing.event_retire_account(insn);
+
+        // Per-instruction extra latency — see the fast-path equivalent
+        // above. Each core's event_insn_latency_account picks its own
+        // policy (unconditional stall, scoreboard timestamp, …).
+        if (insn->latency > 0)
+        {
+            _this->iss.timing.event_insn_latency_account(insn, insn->latency);
+        }
+
+#ifdef CONFIG_GVSOC_STATS_ACTIVE
+        // Close the per-label duration window: exec + data-load/use wait, plus
+        // the branch/jump/div latency just queued in stall_cycles (minus the
+        // at-open fetch baseline). After the latency hook so div/mul is counted.
+        _this->iss.timing.dur_window_close(_this->stall_cycles);
+#endif
 
         _this->insn_exec_power(insn);
 
@@ -330,8 +425,98 @@ void ExecInOrder::exec_instr_check_all(vp::Block *__this, vp::ClockEvent *event)
 
 
 
-void ExecInOrder::insn_terminate(InsnEntry *entry)
+#ifdef CONFIG_GVSOC_ISS_EXEC_INORDER_COMMIT
+void ExecInOrder::drain_entry(InsnEntry *entry)
 {
+    iss_insn_t *insn = this->get_insn(entry);
+#ifdef VP_TRACE_ACTIVE
+    if (this->iss.trace.insn_trace.get_active())
+    {
+        this->iss.trace.insn_trace_dump(insn, insn->addr, entry->trace);
+    }
+#endif
+
+    this->release_entry(entry);
+    this->iss.timing.insn_stall_account();
+}
+#endif
+
+#ifdef CONFIG_GVSOC_ISS_REGFILE_SCOREBOARD
+void ExecInOrder::schedule_scoreboard_release(uint64_t mask, int delay)
+{
+    if (mask == 0) return;
+
+    // The slot is either empty, or its parked mask is already due
+    // (timestamp ≤ current cycle) because the previous release was
+    // scheduled at most one cycle ago. Drain it now (lazy-apply,
+    // independent of when the unblock task happens to fire).
+    if (this->unblock_slot_valid)
+    {
+        this->iss.regfile.sb_reg_invalid_clear_mask(this->unblock_slot_mask);
+        this->unblock_slot_valid = false;
+    }
+
+    // Park the full destination mask for delayed release: an LSU
+    // response writes all its destinations in the same cycle, so
+    // their scoreboard bits all clear together one cycle later.
+    this->unblock_slot_mask = mask;
+    this->unblock_slot_timestamp = this->iss.clock.get_cycles() + delay;
+    this->unblock_slot_valid = true;
+    if (!this->unblock_task_pending)
+    {
+        this->iss.exec.enqueue_task(&this->unblock_task);
+        this->unblock_task_pending = true;
+    }
+}
+
+void ExecInOrder::task_unblock_handle(Iss *iss, Task *task)
+{
+    ExecInOrder *_this = &iss->exec;
+    _this->unblock_task_pending = false;
+    if (_this->unblock_slot_valid &&
+        iss->clock.get_cycles() >= _this->unblock_slot_timestamp)
+    {
+        iss->regfile.sb_reg_invalid_clear_mask(_this->unblock_slot_mask);
+        _this->unblock_slot_valid = false;
+    }
+    if (_this->unblock_slot_valid)
+    {
+        // Slot still pending (timestamp not yet reached). Keep the
+        // task armed so we get another shot next cycle.
+        iss->exec.enqueue_task(task);
+        _this->unblock_task_pending = true;
+    }
+}
+#endif
+
+void ExecInOrder::insn_terminate(InsnEntry *entry, bool defer_scoreboard_release)
+{
+#ifdef CONFIG_GVSOC_ISS_EXEC_INORDER_COMMIT
+    // Flip this entry's ready bit and drain the FIFO from the head
+    // while heads are ready: the entry may be anywhere in the queue
+    // (e.g. with nb_outstanding>1, an earlier async response can
+    // arrive after a later one), but commit only happens once the
+    // head — and every contiguous ready entry behind it — is ready.
+    // For LsuV2 retires `defer_scoreboard_release=true` and the
+    // scoreboard clear is parked by `schedule_scoreboard_release`;
+    // all other async callers (vector unit, WFI, ...) release the
+    // dest regs here so dependents can dispatch.
+    if (!defer_scoreboard_release)
+    {
+        this->iss.regfile.scoreboard_insn_end(this->get_insn(entry));
+    }
+    entry->ready = true;
+    while (this->queue_head != NULL && this->queue_head->ready)
+    {
+        InsnEntry *head = this->queue_head;
+        this->queue_head = head->next;
+        if (this->queue_head == NULL)
+        {
+            this->queue_tail = NULL;
+        }
+        this->drain_entry(head);
+    }
+#else
 #ifdef VP_TRACE_ACTIVE
     if (this->iss.trace.insn_trace.get_active())
     {
@@ -340,11 +525,23 @@ void ExecInOrder::insn_terminate(InsnEntry *entry)
     }
 #endif
 
-    // Make output float registers available to unblock any scalar instructions stalled on them
-    this->iss.regfile.scoreboard_insn_end(this->get_insn(entry));
+    // For LsuV2 retires the dest regs were parked by
+    // `schedule_scoreboard_release` for delayed clear (load-use
+    // stall), so the caller passes `defer_scoreboard_release=true`
+    // and we leave the scoreboard alone here. Every other caller
+    // (vector unit's `Vu::insn_commit`, WFI wake-up, Lsu v1, snitch
+    // variants) leaves it false so the dest regs are released here
+    // — without this, async insns with a scalar dest (e.g. vsetvli
+    // from the vector queue, or any Lsu v1 load) would hang the
+    // dispatcher on the first dependent insn.
+    if (!defer_scoreboard_release)
+    {
+        this->iss.regfile.scoreboard_insn_end(this->get_insn(entry));
+    }
 
     this->release_entry(entry);
     this->iss.timing.insn_stall_account();
+#endif
 }
 
 void ExecInOrder::clock_sync(vp::Block *__this, bool active)
@@ -355,6 +552,11 @@ void ExecInOrder::clock_sync(vp::Block *__this, bool active)
     _this->clock_active = active;
 }
 
+
+void ExecInOrder::switch_to_fast_mode()
+{
+    this->instr_event.set_callback(&ExecInOrder::exec_instr);
+}
 
 void ExecInOrder::retain_check()
 {
@@ -483,12 +685,31 @@ InsnEntry *ExecInOrder::insn_hold(iss_insn_t *insn)
         entry->trace = this->iss.trace.detach_entry();
     }
 #endif
+#ifdef CONFIG_GVSOC_ISS_EXEC_INORDER_COMMIT
+    // Append to the in-order commit FIFO with ready=false. The entry
+    // becomes drainable when `insn_terminate` is called for it (LSU
+    // response for an async load, or sleep_exit for WFI).
+    entry->ready = false;
+    entry->next = NULL;
+    if (this->queue_tail == NULL)
+    {
+        this->queue_head = entry;
+    }
+    else
+    {
+        this->queue_tail->next = entry;
+    }
+    this->queue_tail = entry;
+#endif
     return entry;
 }
 
 iss_insn_t *ExecInOrder::get_insn(InsnEntry *entry)
 {
-    iss_insn_t *insn = this->iss.insn_cache.get_insn(entry->addr);
+    // The entry addr comes from the insn addr field which is a physical address, so
+    // it must not go through the virtual-address lookup (with the MMU enabled, this
+    // could even trigger a page-table walk on a physical address).
+    iss_insn_t *insn = this->iss.insn_cache.get_insn_phys(entry->addr);
     if (!this->iss.decode.is_decoded(insn))
     {
         insn->opcode = entry->opcode;

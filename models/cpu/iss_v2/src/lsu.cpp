@@ -61,16 +61,29 @@ bool Lsu::data_req_virtual(iss_insn_t *insn, iss_addr_t addr, int size, vp::IoRe
 {
     iss_addr_t phys_addr;
     bool use_mem_array;
-    if (opcode != 0)
+    bool miss;
+    if (opcode != vp::IoReqOpcode::READ)
     {
-        if (this->iss.mmu.store_virt_to_phys(addr, phys_addr, use_mem_array)) return false;
+        miss = this->iss.mmu.store_virt_to_phys(addr, phys_addr, use_mem_array);
     }
     else
     {
-        if (this->iss.mmu.load_virt_to_phys(addr, phys_addr, use_mem_array)) return false;
+        miss = this->iss.mmu.load_virt_to_phys(addr, phys_addr, use_mem_array);
     }
 
-    if (this->io_req_denied || this->data_req(insn, addr, size, opcode, is_signed, reg, reg2))
+    if (miss)
+    {
+        // Either an exception was raised (page fault), in which case the core will
+        // jump to the handler, or a page-table walk is pending and the access must
+        // be retried until the TLB is filled.
+        if (!this->iss.exec.has_exception)
+        {
+            this->iss.exec.insn_stall();
+        }
+        return true;
+    }
+
+    if (this->io_req_denied || this->data_req(insn, phys_addr, size, opcode, is_signed, reg, reg2))
     {
         this->iss.exec.insn_stall();
         return true;
@@ -96,8 +109,15 @@ bool Lsu::fence()
 
 void Lsu::data_grant(vp::Block *__this, vp::IoReq *req)
 {
-    // The denied request is granted, we can now allow the core to do other accesses
     Lsu *_this = (Lsu *)__this;
+
+#ifdef CONFIG_GVSOC_ISS_MMU_ENABLED
+    // Grants for the MMU page-table walk request are ignored, the walk is resumed
+    // when the response is received
+    if (req == &_this->iss.mmu.pte_req) return;
+#endif
+
+    // The denied request is granted, we can now allow the core to do other accesses
     _this->io_req_denied = false;
 }
 
@@ -105,9 +125,19 @@ void Lsu::data_response(vp::Block *__this, vp::IoReq *req)
 {
     Lsu *_this = (Lsu *)__this;
     Iss *iss = &_this->iss;
-    LsuReqEntry *entry = (LsuReqEntry *)req;
 
     _this->trace.msg("Received data response (req: %p)\n", req);
+
+#ifdef CONFIG_GVSOC_ISS_MMU_ENABLED
+    // Route back to the MMU the responses of the page-table walk reads
+    if (req == &_this->iss.mmu.pte_req)
+    {
+        _this->iss.mmu.handle_pte_response();
+        return;
+    }
+#endif
+
+    LsuReqEntry *entry = (LsuReqEntry *)req;
 
     _this->iss.exec.insn_terminate(entry->insn_entry);
 
@@ -117,7 +147,9 @@ void Lsu::data_response(vp::Block *__this, vp::IoReq *req)
 bool Lsu::handle_req_response(LsuReqEntry *entry)
 {
     vp::IoReq *req = &entry->req;
-    int64_t latency = req->get_latency();
+    // We add one cycle to latency t model the fact that the response is received now but only
+    // available at next cycle
+    int64_t latency = req->get_latency() + 1;
 
     if (latency > 0)
     {
@@ -175,7 +207,11 @@ bool Lsu::data_req_aligned(iss_insn_t *insn, iss_addr_t addr, int size, vp::IoRe
 {
     this->trace.msg("Data request (addr: 0x%lx, size: 0x%x, opcode: %d)\n", addr, size, opcode);
     LsuReqEntry *entry = this->get_req_entry();
-    if (entry == NULL) return true;
+    if (entry == NULL)
+    {
+        this->trace.msg("Aborting request, no available request\n");
+        return true;
+    }
 
     if (opcode == vp::IoReqOpcode::READ)
     {
@@ -194,6 +230,7 @@ bool Lsu::data_req_aligned(iss_insn_t *insn, iss_addr_t addr, int size, vp::IoRe
 
     vp::IoReq *req = &entry->req;
     req->prepare();
+    req->status = vp::IO_REQ_OK;
     req->set_addr(addr);
     req->set_size(size);
     req->set_opcode(opcode);
@@ -227,7 +264,8 @@ bool Lsu::data_req_aligned(iss_insn_t *insn, iss_addr_t addr, int size, vp::IoRe
         // In case the request is denied, make sure we don't allow any other access
         // until this request is granted
         this->io_req_denied = true;
-        return true;
+        entry->insn_entry = this->iss.exec.insn_hold(insn);
+        return false;
     }
 }
 

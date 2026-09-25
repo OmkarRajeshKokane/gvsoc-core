@@ -19,17 +19,20 @@
  * Authors: Germain Haugou, GreenWaves Technologies (germain.haugou@greenwaves-technologies.com)
  */
 
+#ifdef CONFIG_FAULT_INJECTION
+#include <vp/fault_injector.hpp>
+#endif
 #include <stdio.h>
 #include <string.h>
 #include <vp/vp.hpp>
 #include <vp/signal.hpp>
 #include <vp/stats/stats.hpp>
-#include <vp/memcheck.hpp>
 #include <vp/itf/io.hpp>
 #include <vp/itf/wire.hpp>
-#include <memory/memory_config.hpp>
+#include <vp/debug_mem.hpp>
+#include <memory/memory_config/memory_config.hpp>
 
-class Memory : public vp::Component
+class Memory : public vp::Component, public vp::DebugMemIf
 {
 
 public:
@@ -37,8 +40,12 @@ public:
 
     static vp::IoReqStatus req(vp::Block *__this, vp::IoReq *req);
 
-    uint64_t memcheck_alloc(uint64_t ptr, uint64_t size);
-    uint64_t memcheck_free(uint64_t ptr, uint64_t size);
+    // Backdoor debug access (vp/debug_mem.hpp): direct, zero-time access to
+    // the backing storage. The default debug_mem_regions() advertises this
+    // memory as one flat terminal region.
+    vp::DebugMemIf *debug_mem_if() override { return this; }
+    int debug_mem_access(uint64_t addr, uint8_t *data, uint64_t size,
+        bool is_write) override;
 
     MemoryConfig cfg;
 
@@ -50,17 +57,10 @@ private:
     static void power_ctrl_sync(vp::Block *__this, bool value);
     static void meminfo_sync_back(vp::Block *__this, void **value);
     static void meminfo_sync(vp::Block *__this, void *value);
-    static void memcheck_sync(vp::Block *__this, vp::MemCheckRequest *info);
     vp::IoReqStatus handle_write(uint64_t addr, uint64_t size, uint8_t *data, uint8_t *memcheck_data);
     vp::IoReqStatus handle_read(uint64_t addr, uint64_t size, uint8_t *data, uint8_t *memcheck_data);
     vp::IoReqStatus handle_atomic(uint64_t addr, uint64_t size, uint8_t *in_data, uint8_t *out_data,
         vp::IoReqOpcode opcode, int initiator, uint8_t *in_memcheck_data, uint8_t *out_memcheck_data);
-    // Check if an access to the specified offset falls into a valid buffer
-    bool memcheck_is_valid_address(uint64_t offset);
-    // In case of a faulting access, find the closest valid buffer to the offset
-    void memcheck_find_closest_buffer(uint64_t offset, uint64_t &distance, uint64_t &buffer_offset, uint64_t &buffer_size);
-    void memcheck_buffer_setup(uint64_t base, uint64_t size, bool enable);
-    bool check_buffer_access(uint64_t offset, uint64_t size, bool is_write);
     void log_access(uint64_t addr, uint64_t size, bool is_write);
 
     vp::Trace trace;
@@ -70,17 +70,26 @@ private:
     bool check = false;
     int width_bits = -1;
 
+    // Mask applied to incoming request addresses. -1 (all bits set) means no
+    // truncation. Otherwise it's (truncate_size - 1), where truncate_size is the
+    // user-provided window size to wrap addresses into.
+    uint64_t truncate_mask = (uint64_t)-1;
 
     uint8_t *mem_data;
+    // Per-byte validity shadow of the memory content, used for uninitialized-value
+    // tracking when memcheck is enabled
     uint8_t *memcheck_data = NULL;
     uint8_t *check_mem;
-    uint8_t *memcheck_valid_flags = NULL;
 
     int64_t next_packet_start;
 
     vp::WireSlave<bool> power_ctrl_itf;
     vp::WireSlave<void *> meminfo_itf;
-    vp::WireSlave<vp::MemCheckRequest *> memcheck_itf;
+
+#ifdef CONFIG_FAULT_INJECTION
+    std::map<uint64_t, std::vector<vp::FIRequest *>> stuck_at_map;
+    bool registered_with_fic = false;
+#endif
 
     bool power_trigger;
     bool powered_up;
@@ -99,9 +108,6 @@ private:
     // Load-reserved reservation table
     std::map<uint64_t, uint64_t> res_table;
 
-    uint64_t memcheck_base;
-    uint64_t memcheck_virtual_base;
-    uint64_t memcheck_expansion_factor;
     bool free_mem = false;
     vp::Signal<uint64_t> log_addr;
     vp::Signal<uint64_t> log_size;
@@ -160,9 +166,6 @@ log_is_write(*this, "req_is_write", 1, vp::SignalCommon::ResetKind::HighZ)
     this->meminfo_itf.set_sync_meth(&Memory::meminfo_sync);
     new_slave_port("meminfo", &this->meminfo_itf);
 
-    this->memcheck_itf.set_sync_meth(&Memory::memcheck_sync);
-    new_slave_port("memcheck", &this->memcheck_itf);
-
     js::Config *js_config = get_js_config()->get("power_trigger");
     this->power_trigger = js_config != NULL && js_config->get_bool();
 
@@ -178,6 +181,15 @@ log_is_write(*this, "req_is_write", 1, vp::SignalCommon::ResetKind::HighZ)
     this->check = get_js_config()->get_child_bool("check");
     this->width_bits = get_js_config()->get_child_int("width_bits");
     int align = get_js_config()->get_child_int("align");
+
+    // Optional address truncation. 0 means inactive; any non-zero value (which
+    // should be a power of 2) is taken as the truncation window — incoming addresses
+    // are AND-masked with (truncate_size - 1) before being used as offsets.
+    int64_t truncate_size = get_js_config()->get_int("truncate_size");
+    if (truncate_size > 0)
+    {
+        this->truncate_mask = (uint64_t)truncate_size - 1;
+    }
 
     trace.msg("Building Memory (size: 0x%x, check: %d)\n", this->cfg.size, check);
 
@@ -206,20 +218,6 @@ log_is_write(*this, "req_is_write", 1, vp::SignalCommon::ResetKind::HighZ)
     {
         this->memcheck_data = (uint8_t *)calloc(this->cfg.size, 1);
         if (this->memcheck_data == NULL) throw std::bad_alloc();
-
-        int memcheck_id = this->get_js_config()->get_child_int("memcheck_id");
-        if (memcheck_id != -1)
-        {
-            this->memcheck_expansion_factor = this->get_js_config()->get_child_int("memcheck_expansion_factor");
-            int memcheck_size = this->cfg.size * this->memcheck_expansion_factor;
-            this->memcheck_valid_flags = (uint8_t *)calloc((memcheck_size + 7) / 8, 1);
-            if (this->memcheck_valid_flags == NULL) throw std::bad_alloc();
-
-            this->memcheck_base = this->get_js_config()->get_child_int("memcheck_base");
-            this->memcheck_virtual_base = this->get_js_config()->get_child_int("memcheck_virtual_base");
-
-            this->get_memcheck()->register_memory(memcheck_id, &this->memcheck_itf);
-        }
     }
 
     // Initialize the Memory with a special value to detect uninitialized
@@ -286,7 +284,7 @@ vp::IoReqStatus Memory::req(vp::Block *__this, vp::IoReq *req)
 {
     Memory *_this = (Memory *)__this;
 
-    uint64_t offset = req->get_addr();
+    uint64_t offset = req->get_addr() & _this->truncate_mask;
     uint8_t *data = req->get_data();
     uint64_t size = req->get_size();
 
@@ -314,7 +312,7 @@ vp::IoReqStatus Memory::req(vp::Block *__this, vp::IoReq *req)
         if (_this->width_bits != -1)
         {
     #define MAX(a, b) (((a) > (b)) ? (a) : (b))
-            int duration = MAX(size >> _this->width_bits, 1);
+            int duration = ((size - 1) >> _this->width_bits) + 1;
             req->set_duration(duration);
             int64_t cycles = _this->clock.get_cycles();
             int64_t diff = _this->next_packet_start - cycles;
@@ -379,6 +377,14 @@ vp::IoReqStatus Memory::req(vp::Block *__this, vp::IoReq *req)
         return vp::IO_REQ_INVALID;
     }
 
+#ifdef CONFIG_FAULT_INJECTION
+    if (req->fault_upset_request)
+    {
+        _this->mem_data[offset] = _this->mem_data[offset] ^ req->mask;
+        return vp::IO_REQ_OK;
+    }
+#endif
+
     if (req->get_opcode() == vp::IoReqOpcode::READ)
     {
 #ifdef VP_MEMCHECK_ACTIVE
@@ -414,6 +420,29 @@ vp::IoReqStatus Memory::req(vp::Block *__this, vp::IoReq *req)
 
 
 
+int Memory::debug_mem_access(uint64_t addr, uint8_t *data, uint64_t size, bool is_write)
+{
+    uint64_t offset = addr & this->truncate_mask;
+
+    if (offset + size > (uint64_t)this->cfg.size)
+    {
+        return -1;
+    }
+
+    if (is_write)
+    {
+        memcpy((void *)&this->mem_data[offset], (void *)data, size);
+    }
+    else
+    {
+        memcpy((void *)data, (void *)&this->mem_data[offset], size);
+    }
+
+    return 0;
+}
+
+
+
 vp::IoReqStatus Memory::handle_write(uint64_t offset, uint64_t size, uint8_t *data, uint8_t *req_memcheck_data)
 {
     // Writes on powered-down memory are silently ignored
@@ -423,11 +452,6 @@ vp::IoReqStatus Memory::handle_write(uint64_t offset, uint64_t size, uint8_t *da
     }
 
 #ifdef VP_MEMCHECK_ACTIVE
-    if (this->check_buffer_access(offset, size, true))
-    {
-        return vp::IO_REQ_INVALID;
-    }
-
     if (this->memcheck_data != NULL)
     {
         if (req_memcheck_data != NULL)
@@ -446,160 +470,36 @@ vp::IoReqStatus Memory::handle_write(uint64_t offset, uint64_t size, uint8_t *da
     if (data)
     {
         memcpy((void *)&this->mem_data[offset], (void *)data, size);
+
+#ifdef CONFIG_FAULT_INJECTION
+        auto it = this->stuck_at_map.lower_bound(offset);
+
+        while (it != this->stuck_at_map.end() && it->first < offset + size)
+        {
+            for (const auto& tf : it->second)
+            {
+                uint8_t mask = (uint8_t) (1u << tf->bit);
+                
+                
+                if (tf->is_high)
+                {
+                    this->mem_data[tf->addr] |= mask;
+                }
+                else
+                {
+                    this->mem_data[tf->addr] &= ~mask;
+                }
+            }
+
+            ++it;
+        }
+
+#endif
     }
 
     return vp::IO_REQ_OK;
 }
 
-
-bool Memory::memcheck_is_valid_address(uint64_t offset)
-{
-    // Valid bytes are monitored through an array, one bit per byte
-    size_t valid_byte = offset >> 3;
-    int valid_bit = offset & 0x7;
-    return (this->memcheck_valid_flags[valid_byte] >> valid_bit) & 1;
-}
-
-void Memory::memcheck_find_closest_buffer(uint64_t offset, uint64_t &distance,
-    uint64_t &buffer_offset, uint64_t &buffer_size)
-{
-    // First go through the memory in descending order from the current offset to see if we find a
-    // valid buffer before the offset
-    uint64_t valid_before_offset;
-    uint64_t valid_before_offset_last;
-    uint64_t distance_before = 0;
-
-    if (offset > 0)
-    {
-        uint64_t current_offset = offset;
-
-        // First look for the first valid bit to get end of buffer
-        do
-        {
-            current_offset--;
-
-            if (this->memcheck_is_valid_address(current_offset))
-            {
-                valid_before_offset_last = current_offset;
-                valid_before_offset = current_offset;
-                distance_before = offset - current_offset;
-                break;
-            }
-        } while (current_offset != 0);
-
-        // And then for the first invalid bit to get start of buffer
-        if (current_offset > 0)
-        {
-            do
-            {
-                current_offset--;
-                if (this->memcheck_is_valid_address(current_offset))
-                {
-                    valid_before_offset = current_offset;
-                }
-                else
-                {
-                    break;
-                }
-            } while (current_offset != 0);
-        }
-    }
-
-    // First go through the memory in ascending order from the current offset to see if we find a
-    // valid buffer after the offset
-    uint64_t valid_after_offset;
-    uint64_t valid_after_offset_last;
-    uint64_t distance_after = 0;
-    // First look for the first valid bit to get start of buffer
-    for (uint64_t current_offset = offset; current_offset<this->cfg.size; current_offset++)
-    {
-        if (this->memcheck_is_valid_address(current_offset))
-        {
-            valid_after_offset = current_offset;
-            valid_after_offset_last = current_offset;
-            distance_after = current_offset - offset;
-            break;
-        }
-    }
-
-    // And then for the first invalid bit to get end of buffer
-    for (uint64_t current_offset = valid_after_offset; current_offset<this->cfg.size; current_offset++)
-    {
-        if (this->memcheck_is_valid_address(current_offset))
-        {
-            valid_after_offset_last = current_offset;
-        }
-        else
-        {
-            break;
-        }
-    }
-
-    if (distance_before == 0 && distance_after == 0)
-    {
-        distance = 0;
-        return;
-    }
-
-    // Finally return the one which is closer
-    if (distance_before == 0 || (distance_after != 0 && distance_after < distance_before))
-    {
-        distance = distance_after;
-        buffer_offset = valid_after_offset;
-        buffer_size = valid_after_offset_last - valid_after_offset + 1;
-    }
-    else
-    {
-        distance = distance_before;
-        buffer_offset = valid_before_offset;
-        buffer_size = valid_before_offset_last - valid_before_offset + 1;
-    }
-}
-
-bool Memory::check_buffer_access(uint64_t offset, uint64_t size, bool is_write)
-{
-    if (this->memcheck_valid_flags != NULL)
-    {
-        // Go through all bytes of the access to see if one is not valid
-        for (int i=0; i<size; i++)
-        {
-            uint64_t current_offset = offset + i;
-            bool is_valid = this->memcheck_is_valid_address(current_offset);
-
-            if (!is_valid)
-            {
-                // If not, get the closest valid buffer and throw a warning to help the user
-                // understand better the overflow
-                uint64_t buffer_offset, buffer_size, distance;
-                this->memcheck_find_closest_buffer(current_offset, distance, buffer_offset, buffer_size);
-
-                this->trace.force_warning_no_error("%s access outside buffer "
-                    "(virtual addr: 0x%x)\n", is_write ? "Write" : "Read",
-                    current_offset + this->memcheck_virtual_base);
-
-                if (distance == 0)
-                {
-                    this->trace.force_warning_no_error("%s access with no buffer\n", is_write ? "Write" : "Read");
-                    return true;
-                }
-                else
-                {
-                    bool is_before = buffer_offset > current_offset;
-                    uint64_t buffer_real_addr = (buffer_offset - buffer_size * (this->memcheck_expansion_factor  / 2)) /
-                        this->memcheck_expansion_factor + this->memcheck_base;
-
-                    this->trace.force_warning_no_error("%s access is %ld byte(s) %s buffer (buffer_addr: 0x%llx, buffer_virtual_addr: %llx, buffer_size: 0x%llx)\n",
-                        is_write ? "Write" : "Read", distance, is_before ? "before" : "after",
-                        buffer_real_addr, buffer_offset + this->memcheck_virtual_base, buffer_size);
-
-                    return true;
-                }
-            }
-        }
-    }
-
-    return false;
-}
 
 vp::IoReqStatus Memory::handle_read(uint64_t offset, uint64_t size, uint8_t *data, uint8_t *req_memcheck_data)
 {
@@ -611,12 +511,6 @@ vp::IoReqStatus Memory::handle_read(uint64_t offset, uint64_t size, uint8_t *dat
     }
 
 #ifdef VP_MEMCHECK_ACTIVE
-
-    if (this->check_buffer_access(offset, size, false))
-    {
-        return vp::IO_REQ_INVALID;
-    }
-
     if (this->memcheck_data != NULL)
     {
         if (req_memcheck_data != NULL)
@@ -748,6 +642,19 @@ void Memory::reset(bool active)
     {
         this->next_packet_start = 0;
         this->powered_up = true;
+
+#ifdef CONFIG_FAULT_INJECTION
+        if (!this->registered_with_fic)
+        {
+            bool fic_enabled = this->get_js_config()->get_child_bool("fic_enabled");
+            if (fic_enabled)
+            {
+                vp::FIC_registrator *fic = (vp::FIC_registrator *) this->get_service("FIC");
+                fic->register_memory(this, this->mem_data, this->cfg.size, this->stuck_at_map);
+                this->registered_with_fic = true;
+            }
+        }
+#endif
     }
 }
 
@@ -777,99 +684,6 @@ void Memory::meminfo_sync(vp::Block *__this, void *value)
 }
 
 
-
-void Memory::memcheck_sync(vp::Block *__this, vp::MemCheckRequest *req)
-{
-    Memory *_this = (Memory *)__this;
-    if (req->is_alloc)
-    {
-        req->offset = _this->memcheck_alloc(req->offset, req->size);
-    }
-    else
-    {
-        req->offset = _this->memcheck_free(req->offset, req->size);
-    }
-}
-
-
-void Memory::memcheck_buffer_setup(uint64_t base, uint64_t size, bool enable)
-{
-#ifdef VP_MEMCHECK_ACTIVE
-
-    if (this->memcheck_data != NULL)
-    {
-        if (!enable)
-        {
-            memset(&this->memcheck_data[base], 0, size);
-        }
-    }
-
-
-    if (this->memcheck_valid_flags != NULL)
-    {
-        this->trace.msg(vp::Trace::LEVEL_INFO, "%s valid buffer (offset: 0x%lx, size: 0x%lx)\n",
-            enable ? "Adding" : "Removing", base, size);
-
-        if (base + size >= this->cfg.size * this->memcheck_expansion_factor)
-        {
-            this->trace.force_warning("Trying to %s invalid buffer  (offset: 0x%lx, size: 0x%lx, mem_size: 0x%lx)\n",
-                enable ? "add" : "remove", base, size, this->cfg.size);
-            return;
-        }
-
-        for (int i=0; i<size; i++)
-        {
-            uint64_t offset = base + i;
-            int valid_byte = offset >> 3;
-            int valid_bit = offset & 0x7;
-            if (enable)
-            {
-                this->memcheck_valid_flags[valid_byte] |= 1 << valid_bit;
-            }
-            else
-            {
-                this->memcheck_valid_flags[valid_byte] &= ~(1 << valid_bit);
-            }
-        }
-    }
-
-#endif
-}
-
-uint64_t Memory::memcheck_alloc(uint64_t ptr, uint64_t size)
-{
-#ifdef VP_MEMCHECK_ACTIVE
-    if (this->memcheck_valid_flags != NULL)
-    {
-        uint64_t virtual_offset = (ptr - this->memcheck_base) * this->memcheck_expansion_factor +
-            size * (this->memcheck_expansion_factor  / 2) ;
-        uint64_t virtual_ptr = virtual_offset + this->memcheck_virtual_base;
-
-        this->memcheck_buffer_setup(virtual_offset, size, true);
-
-        return virtual_ptr;
-    }
-#endif
-
-    return ptr;
-}
-
-uint64_t Memory::memcheck_free(uint64_t virtual_ptr, uint64_t size)
-{
-#ifdef VP_MEMCHECK_ACTIVE
-    if (this->memcheck_valid_flags != NULL)
-    {
-        uint64_t virtual_offset = virtual_ptr - this->memcheck_virtual_base;
-        uint64_t offset = (virtual_offset - size * (this->memcheck_expansion_factor  / 2)) / this->memcheck_expansion_factor + this->memcheck_base;
-
-        this->memcheck_buffer_setup(virtual_offset, size, false);
-
-        return offset;
-    }
-#endif
-
-    return virtual_ptr;
-}
 
 extern "C" vp::Component *gv_new(vp::ComponentConf &config)
 {

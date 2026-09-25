@@ -228,12 +228,6 @@ public:
     iss_reg_t pcmr;
 #endif
 
-#if defined(CONFIG_GVSOC_ISS_STACK_CHECKER)
-    iss_reg_t stack_conf;
-    iss_reg_t stack_start;
-    iss_reg_t stack_end;
-#endif
-
     iss_reg_t scratch0;
     iss_reg_t scratch1;
     iss_fcsr_t fcsr;
@@ -247,8 +241,21 @@ public:
     CsrReg vtype;
     CsrReg vlenb;
 
+    // Hwloop CSR storage now lives in the Hwloop module (see
+    // include/hwloop/hwloop.hpp). The LPSTART / LPEND / LPCOUNT
+    // CSR reads and writes route through iss.hwloop in csr.cpp.
+    //
+    // The CSR addresses for the two hwloops are defined here so the
+    // dispatch in csr.cpp doesn't need to pull in v1's archi headers.
 #if defined(CONFIG_GVSOC_ISS_RI5KY) || defined(CONFIG_GVSOC_ISS_HWLOOP)
-    iss_reg_t hwloop_regs[HWLOOP_NB_REGS];
+#ifndef CSR_HWLOOP0_START
+#define CSR_HWLOOP0_START   0x7C0
+#define CSR_HWLOOP0_END     0x7C1
+#define CSR_HWLOOP0_COUNTER 0x7C2
+#define CSR_HWLOOP1_START   0x7C4
+#define CSR_HWLOOP1_END     0x7C5
+#define CSR_HWLOOP1_COUNTER 0x7C6
+#endif
 #endif
 
 private:

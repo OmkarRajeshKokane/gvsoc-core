@@ -14,6 +14,8 @@
 # limitations under the License.
 #
 
+from __future__ import annotations
+
 import gvsoc.systree
 
 from memory.memory_config import MemoryConfig
@@ -50,20 +52,22 @@ class Memory(gvsoc.systree.Component):
         should be set to True only if needed.
     latency: int
         Specify extra latency which will be added to any incoming request.
-    memcheck_id: int
-        If this memory is used to track buffer overflow, this gives the global memory check id.
-    memcheck_base: int
-        Absolute base of memory where buffer overflow is tracked.
-    memcheck_virtual_base: int
-        Absolute virtual base of allocated buffers.
-    memcheck_expansion_factor: int
-        Extra size used to track buffer overflow.
+    truncate_size: int
+        If non-zero, incoming request addresses are masked with (truncate_size - 1)
+        before accessing the backing array. Lets the caller wrap or fold the incoming
+        address space into the memory. Defaults to 0 (no truncation — addresses are
+        used as-is). truncate_size must be a power of 2 if used.
+    fic_enabled: bool
+        If True, this memory is being fault injected.
     """
     def __init__(self, parent: gvsoc.systree.Component, name: str, size: int=0, width_log2: int=-1,
             stim_file: str=None, power_trigger: bool=False,
-            align: int=0, atomics: bool=False, latency=0, memcheck_id: int=-1, memcheck_base: int=0,
-            memcheck_virtual_base: int=0, memcheck_expansion_factor: int=5, init=True,
-            attributes: MemoryConfig | None=None):
+            align: int=0, atomics: bool=False, latency=0, init=True,
+            truncate_size: int=0, fic_enabled=False,
+            attributes: MemoryConfig | None=None, config: MemoryConfig | None=None):
+
+        if config is not None:
+            attributes = config
 
         # Always create a MemoryConfig for the compiled tree
         if attributes is None:
@@ -79,6 +83,9 @@ class Memory(gvsoc.systree.Component):
         if atomics or attributes is not None and attributes.atomics:
             self.add_c_flags(['-DCONFIG_ATOMICS=1'])
 
+        if fic_enabled:
+            self.add_c_flags(['-DCONFIG_FAULT_INJECTION=1'])
+
         self.add_properties({
             'init': init,
             'size': size if attributes is None else attributes.size,
@@ -87,10 +94,8 @@ class Memory(gvsoc.systree.Component):
             'width_bits': width_log2,
             'align': align,
             'latency': latency if attributes is None else attributes.latency,
-            'memcheck_id': memcheck_id,
-            'memcheck_base': memcheck_base,
-            'memcheck_virtual_base': memcheck_virtual_base,
-            'memcheck_expansion_factor': memcheck_expansion_factor,
+            'truncate_size': truncate_size,
+            'fic_enabled': fic_enabled,
         })
 
     def i_INPUT(self) -> gvsoc.systree.SlaveItf:

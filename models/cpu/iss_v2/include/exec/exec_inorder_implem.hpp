@@ -108,8 +108,9 @@ inline bool ExecInOrder::handle_tasks()
 
         do
         {
+            Task *next = task->next;
             task->callback(&this->iss, task);
-            task = task->next;
+            task = next;
         } while (task);
 
         // In case the core is retained, it means it was only executing tasks. Try to stop it
@@ -133,10 +134,6 @@ inline bool ExecInOrder::can_switch_to_fast_mode()
 #ifdef VP_TRACE_ACTIVE
     return false;
 #else
-#if defined(ISS_HAS_PERF_COUNTERS)
-    return !(this->iss.csr.pcmr & CSR_PCMR_ACTIVE);
-#else
     return true;
-#endif
 #endif
 }

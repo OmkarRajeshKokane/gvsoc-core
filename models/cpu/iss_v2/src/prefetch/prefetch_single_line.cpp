@@ -19,13 +19,18 @@
  * Authors: Germain Haugou, GreenWaves Technologies (germain.haugou@greenwaves-technologies.com)
  */
 
+#ifdef CONFIG_PREFETCHER_FI
+#include <vp/fault_injector.hpp>
+#endif
 #include <vp/vp.hpp>
 
 PrefetchSingleLine::PrefetchSingleLine(Iss &iss)
     : iss(iss)
 {
     this->iss.traces.new_trace("prefetcher", &this->trace, vp::DEBUG);
+#ifndef CONFIG_GVSOC_ISS_LSU_V2
     this->fetch_itf.set_resp_meth(&PrefetchSingleLine::fetch_response);
+#endif
     this->iss.new_master_port("fetch", &fetch_itf, (vp::Block *)this);
 }
 
@@ -35,6 +40,21 @@ void PrefetchSingleLine::reset(bool active)
     {
         this->flush();
         this->prefetch_insn = NULL;
+#ifdef CONFIG_GVSOC_ISS_LSU_V2
+        this->fetch_denied = false;
+#endif
+#ifdef CONFIG_PREFETCHER_FI
+        if (!this->registered_with_fic)
+        {
+            bool fic_enabled = this->iss.top.get_js_config()->get_child_bool("prefetcher_fi");
+            if (fic_enabled)
+            {
+                vp::FIC_registrator *fic = (vp::FIC_registrator *) this->iss.top.get_service("FIC");
+                fic->register_prefetcher(&this->iss.top, this->data, ISS_PREFETCHER_SIZE);
+            }
+            this->registered_with_fic = true;
+        }
+#endif
     }
 }
 
@@ -149,12 +169,50 @@ int PrefetchSingleLine::send_fetch_req(uint64_t addr, uint8_t *data, uint64_t si
 
     this->trace.msg(vp::Trace::LEVEL_TRACE, "Fetch request (addr: 0x%lx, size: 0x%lx)\n", addr, size);
 
+#ifdef CONFIG_GVSOC_ISS_LSU_V2
+    req->prepare();
+#else
     req->init();
+#endif
     req->set_addr(addr);
     req->set_size(size);
     req->set_is_write(is_write);
     req->set_data(data);
     vp::IoReqStatus err = this->fetch_itf.req(req);
+#ifdef CONFIG_GVSOC_ISS_LSU_V2
+    if (err == vp::IO_REQ_DONE)
+    {
+        if (req->get_resp_status() == vp::IO_RESP_INVALID)
+        {
+#ifndef CONFIG_GVSOC_ISS_RISCV_EXCEPTIONS
+            this->trace.force_warning("Invalid fetch request (addr: 0x%x, size: 0x%x)\n", addr, size);
+#endif
+            this->iss.exception.raise(this->iss.exec.current_insn, ISS_EXCEPT_INSN_FAULT);
+            return 1;
+        }
+    }
+    else
+    {
+        if (err == vp::IO_REQ_DENIED)
+        {
+            // Not accepted at all: no response is coming for this request, the
+            // target owes us a retry() and we must re-send the very same
+            // object then (io_v2 deny/retry handshake). Happens as soon as the
+            // fetch path is shared and outstanding-limited, e.g. every core's
+            // fetch going through the one icache refill port while the caches
+            // are bypassed.
+            this->fetch_denied = true;
+            this->trace.msg(vp::Trace::LEVEL_TRACE,
+                "Fetch denied, waiting for retry\n");
+        }
+        else
+        {
+            this->trace.msg(vp::Trace::LEVEL_TRACE, "Waiting for asynchronous response\n");
+        }
+        this->iss.timing.event_imiss_start();
+        return -1;
+    }
+#else
     if (err != vp::IO_REQ_OK)
     {
         if (err == vp::IO_REQ_INVALID)
@@ -168,9 +226,11 @@ int PrefetchSingleLine::send_fetch_req(uint64_t addr, uint8_t *data, uint64_t si
         else
         {
             this->trace.msg(vp::Trace::LEVEL_TRACE, "Waiting for asynchronous response\n");
+            this->iss.timing.event_imiss_start();
             return -1;
         }
     }
+#endif
 
     this->iss.timing.event_fetch_account();
     if (req->get_latency() > 1)
@@ -188,15 +248,53 @@ int PrefetchSingleLine::fill(iss_addr_t addr)
     return this->send_fetch_req(aligned_addr, this->data, CONFIG_GVSOC_ISS_PREFETCH_SIZE, false);
 }
 
+#ifdef CONFIG_GVSOC_ISS_LSU_V2
+void PrefetchSingleLine::fetch_retry(vp::Block *__this, vp::IoRetryChannel)
+{
+    PrefetchSingleLine *_this = (PrefetchSingleLine *)__this;
+
+    if (!_this->fetch_denied)
+    {
+        // Retry broadcast with nothing held here: another master was the one
+        // denied on the shared path. Nothing to re-send.
+        return;
+    }
+
+    _this->trace.msg(vp::Trace::LEVEL_TRACE, "Re-sending denied fetch\n");
+
+    // Re-issue synchronously, inside the retry() callback: a zero-buffer
+    // arbiter only keeps its accept window open for the duration of this call.
+    vp::IoReqStatus err = _this->fetch_itf.req(&_this->fetch_req);
+
+    if (err == vp::IO_REQ_DENIED)
+    {
+        // Lost the arbitration again; keep holding for the next retry.
+        return;
+    }
+
+    _this->fetch_denied = false;
+
+    if (err == vp::IO_REQ_DONE)
+    {
+        // Served inline this time: finish it exactly like an asynchronous
+        // response would, which un-retains the core and resumes the refill.
+        // (the port registers the block as a cast of this pointer, cf. build())
+        _this->fetch_response((vp::Block *)_this, &_this->fetch_req);
+    }
+    // GRANTED: fetch_response will resume the core when the data arrives.
+}
+
+
+vp::IoRespAck PrefetchSingleLine::fetch_response(vp::Block *__this, vp::IoReq *req)
+#else
 void PrefetchSingleLine::fetch_response(vp::Block *__this, vp::IoReq *req)
+#endif
 {
     PrefetchSingleLine *_this = (PrefetchSingleLine *)__this;
 
     _this->trace.msg(vp::Trace::LEVEL_TRACE, "Received fetch response\n");
 
-    // Since a pending response can also include a latency, we need to account it
-    // as a stall
-    _this->iss.timing.stall_fetch_account(req->get_latency());
+    _this->iss.timing.event_imiss_stop();
 
     // Now unstall the core and call the fetch callback so that we can continue the refill
     // operation
@@ -205,6 +303,10 @@ void PrefetchSingleLine::fetch_response(vp::Block *__this, vp::IoReq *req)
     {
         _this->fetch_stall_callback(_this);
     }
+
+#ifdef CONFIG_GVSOC_ISS_LSU_V2
+    return vp::IO_RESP_ACCEPTED;
+#endif
 }
 
 bool PrefetchSingleLine::fetch(iss_reg_t addr)

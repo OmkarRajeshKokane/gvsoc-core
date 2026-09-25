@@ -43,6 +43,7 @@ void Iss::start()
     this->mmu.start();
     this->pmp.start();
     this->timing.start();
+    this->hwloop.start();
 #ifdef CONFIG_GVSOC_ISS_OFFLOAD
     this->offload.start();
 #endif
@@ -53,7 +54,6 @@ void Iss::stop()
     this->insn_cache.stop();
     this->trace.stop();
     this->syscalls.stop();
-    this->gdbserver.stop();
 #if defined(CONFIG_ISS_HAS_VECTOR)
     this->vector.stop();
 #endif
@@ -70,6 +70,7 @@ void Iss::stop()
     this->mmu.stop();
     this->pmp.stop();
     this->timing.stop();
+    this->hwloop.stop();
 #ifdef CONFIG_GVSOC_ISS_OFFLOAD
     this->offload.stop();
 #endif
@@ -97,24 +98,118 @@ void Iss::reset(bool active)
     this->mmu.reset(active);
     this->pmp.reset(active);
     this->timing.reset(active);
+    this->hwloop.reset(active);
 #ifdef CONFIG_GVSOC_ISS_OFFLOAD
     this->offload.reset(active);
 #endif
 }
 
 Iss::Iss(vp::ComponentConf &config)
-: vp::Component(config), insn_cache(*this), decode(*this), trace(*this), syscalls(*this), gdbserver(*this),
+: vp::Component(config, this->cfg), insn_cache(*this), decode(*this), trace(*this), syscalls(*this), gdbserver(*this),
+memcheck(*this),
 
 #if defined(CONFIG_ISS_HAS_VECTOR)
 vector(*this),
 #endif
 exec(*this), regfile(*this),
 csr(*this), prefetch(*this), lsu(*this), core(*this), irq(*this), exception(*this), mmu(*this),
-pmp(*this), timing(*this), arch(*this)
+pmp(*this), timing(*this), hwloop(*this), arch(*this)
 #ifdef CONFIG_GVSOC_ISS_OFFLOAD
 , offload(*this)
 #endif
 {
+}
+
+std::string Iss::handle_command(gv::GvProxy *proxy, FILE *req_file, FILE *reply_file,
+    std::vector<std::string> args, std::string req)
+{
+    if (args.size() >= 2 && args[0] == "breakpoint_insert")
+    {
+        uint64_t addr = strtoull(args[1].c_str(), NULL, 0);
+        this->gdbserver.gdbserver_breakpoint_insert(addr);
+        return "ok";
+    }
+    else if (args.size() >= 2 && args[0] == "breakpoint_remove")
+    {
+        uint64_t addr = strtoull(args[1].c_str(), NULL, 0);
+        this->gdbserver.gdbserver_breakpoint_remove(addr);
+        return "ok";
+    }
+    else if (args.size() >= 1 && args[0] == "breakpoint_status")
+    {
+        if (this->gdbserver.breakpoint_hit)
+        {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "hit=1 addr=0x%lx",
+                (unsigned long)this->gdbserver.breakpoint_hit_addr);
+            return std::string(buf);
+        }
+        return "hit=0";
+    }
+    else if (args.size() >= 1 && args[0] == "resume")
+    {
+        if (this->exec.halted.get())
+        {
+            // If we are halted on a breakpoint, arm a one-shot skip so this continue steps over the
+            // breakpoint instruction instead of immediately re-triggering the same breakpoint.
+            if (this->gdbserver.breakpoint_check_pc(this->exec.current_insn))
+            {
+                this->gdbserver.bp_skip_active = true;
+                this->gdbserver.bp_skip_pc = this->exec.current_insn;
+            }
+            this->gdbserver.breakpoint_hit = false;
+            this->gdbserver.watchpoint_hit = false;
+            this->exec.halted.set(false);
+            this->exec.retain_dec();
+        }
+        return "ok";
+    }
+    else if (args.size() >= 4 && args[0] == "watchpoint_insert")
+    {
+        bool is_write = (args[1] != "0");
+        uint64_t addr = strtoull(args[2].c_str(), NULL, 0);
+        int size = strtol(args[3].c_str(), NULL, 0);
+        this->gdbserver.gdbserver_watchpoint_insert(is_write, addr, size);
+        return "ok";
+    }
+    else if (args.size() >= 4 && args[0] == "watchpoint_remove")
+    {
+        bool is_write = (args[1] != "0");
+        uint64_t addr = strtoull(args[2].c_str(), NULL, 0);
+        int size = strtol(args[3].c_str(), NULL, 0);
+        this->gdbserver.gdbserver_watchpoint_remove(is_write, addr, size);
+        return "ok";
+    }
+    else if (args.size() >= 1 && args[0] == "watchpoint_status")
+    {
+        if (this->gdbserver.watchpoint_hit)
+        {
+            char buf[96];
+            snprintf(buf, sizeof(buf), "hit=1 addr=0x%lx is_write=%d",
+                (unsigned long)this->gdbserver.watchpoint_hit_addr,
+                this->gdbserver.watchpoint_hit_is_write ? 1 : 0);
+            return std::string(buf);
+        }
+        return "hit=0";
+    }
+    else if (args.size() >= 1 && args[0] == "reg_read")
+    {
+        std::string result;
+        char buf[32];
+        for (int i = 0; i < 32; i++)
+        {
+            snprintf(buf, sizeof(buf), "%s0x%lx", i > 0 ? " " : "",
+                (unsigned long)this->regfile.get_reg_untimed(i));
+            result += buf;
+        }
+        // Append PC as register 32
+        snprintf(buf, sizeof(buf), " 0x%lx",
+            (unsigned long)(this->exec.current_insn ? this->exec.current_insn : 0));
+        result += buf;
+        return result;
+    }
+
+    return "";
 }
 
 extern "C" vp::Component *gv_new(vp::ComponentConf &config)

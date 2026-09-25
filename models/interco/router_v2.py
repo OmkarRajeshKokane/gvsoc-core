@@ -1,0 +1,563 @@
+# SPDX-FileCopyrightText: 2026 ETH Zurich, University of Bologna and EssilorLuxottica SAS
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# Authors: Germain Haugou (germain.haugou@gmail.com)
+
+from __future__ import annotations
+
+import sys
+from typing import ClassVar
+
+import gvsoc.systree
+import gvrun.timing
+from gvsoc.signature import IoV2Beat, IoV2SingleReq
+from config_tree import Config, cfg_field, HasSize
+
+
+# Router implementation kinds. Each maps to a different C++ source.
+KIND_UNTIMED      = 'untimed'
+KIND_BANDWIDTH    = 'bandwidth'
+KIND_BACKPRESSURE = 'backpressure'
+KIND_BEAT         = 'beat'
+
+# Resolve the kind from the hierarchical timing level (the default).
+KIND_AUTO         = 'auto'
+
+_SOURCES = {
+    KIND_UNTIMED:      'interco/router/router_v2_untimed.cpp',
+    KIND_BANDWIDTH:    'interco/router/router_v2_bandwidth.cpp',
+    KIND_BACKPRESSURE: 'interco/router/router_v2_backpressure.cpp',
+    KIND_BEAT:         'interco/router/router_v2_beat.cpp',
+}
+
+# Timing level → kind. 'backpressure' is never auto-selected: it is a
+# protocol choice (blocking handshake), not an accuracy rung.
+_LEVEL_TO_KIND = {
+    gvrun.timing.FUNCTIONAL: KIND_UNTIMED,
+    gvrun.timing.TIMED:      KIND_BANDWIDTH,
+    gvrun.timing.CYCLE:      KIND_BEAT,
+}
+
+
+class RouterMapping(Config, HasSize):
+    """One address-range entry inside a :class:`RouterConfig`.
+
+    The router applies ``addr - remove_offset + add_offset`` before forwarding
+    the request to the master port named ``name``.
+
+    Attributes
+    ----------
+    base : int
+        Start of the mapped address range.
+    size : int
+        Range size in bytes; ``0`` makes this entry the catch-all.
+    remove_base : bool
+        Convenience flag honoured by :meth:`Router.o_MAP`: when ``True``
+        (the default), ``remove_offset`` defaults to ``base`` so the
+        request address is rebased to the downstream port. Set to
+        ``False`` for pass-through routing (e.g. router-to-router cascades
+        that should preserve the original address).
+    remove_offset : int
+        Subtracted from the request address before forwarding.
+    add_offset : int
+        Added to the request address before forwarding.
+    latency : int
+        Per-mapping latency in cycles, applied on top of the per-router
+        ``latency``. Used by the bandwidth and backpressure variants.
+    is_error : bool
+        Marks this mapping as the error sink — requests resolving to it are
+        responded with ``IO_RESP_INVALID``.
+    max_pending_bursts : int
+        Beat variant only. Outstanding transactions the downstream slave
+        accepts on this output, per channel (reads and writes counted
+        separately, like an AXI slave's ``MAX_READ_TXNS`` /
+        ``MAX_WRITE_TXNS``). A burst counts from the forward of its first
+        beat to its completion (last response beat or write ack). While the
+        output is at its limit no input can open a new burst on it, so a
+        waiting master gets in only when one transaction finishes: the
+        transaction-granular arbitration of a slave that serialises its
+        requests. ``0`` (default) is unlimited.
+    """
+
+    _defer_parent_init: ClassVar[bool] = True
+
+    base: int = cfg_field(default=0, dump=True, fmt="hex", desc=(
+        "Base address of the mapping"
+    ))
+
+    size: int = cfg_field(default=0, dump=True, fmt="hex", desc=(
+        "Size of the mapping"
+    ))
+
+    remove_base: bool = cfg_field(default=True, dump=True, desc=(
+        "Remove the base address when a request is propagated using this mapping. "
+        "Defaults to True (rebase to downstream port); set False for pass-through routing."
+    ))
+
+    remove_offset: int = cfg_field(default=0, dump=True, fmt="hex", desc=(
+        "Subtracted from the request address before forwarding. Set automatically "
+        "from ``base`` when ``remove_base`` is true."
+    ))
+
+    add_offset: int = cfg_field(default=0, dump=True, fmt="hex", desc=(
+        "Added to the request address before forwarding."
+    ))
+
+    latency: int = cfg_field(default=0, dump=True, desc=(
+        "Global latency applied to all incoming requests. This impacts the start "
+        "time of the burst."
+    ))
+
+    is_error: bool = cfg_field(default=False, dump=True, desc=(
+        "If true, this mapping is treated as an error sink: requests resolving to "
+        "it are responded with IO_RESP_INVALID."
+    ))
+
+    max_pending_bursts: int = cfg_field(default=0, dump=True, desc=(
+        "Outstanding transactions the downstream slave accepts on this output, per "
+        "channel (beat variant). A burst is counted from the forward of its first beat "
+        "to its completion. 0 means unlimited."
+    ))
+
+
+class RouterConfig(Config, HasSize):
+    """Configuration class for the io_v2 :class:`Router`.
+
+    Carries every parameter the router needs — implementation flavour
+    (``kind``), per-router timing and topology (``latency``, ``bandwidth``,
+    ``shared_rw_channel``, ``width``, ``max_input_pending_size``,
+    ``max_pending_bursts``, ``nb_input_port``), and the address mappings list.
+
+    A single template can be reused across several routers: ``Router``'s
+    constructor copies the scalar fields into a per-instance config so each
+    router keeps its own mappings list and its own dynamic ``nb_input_port``
+    counter.
+
+    Attributes
+    ----------
+    kind : str
+        Implementation flavour. One of ``'untimed'``, ``'bandwidth'``,
+        ``'backpressure'``, ``'beat'`` or ``'auto'`` (default). ``'auto'``
+        resolves the flavour from the hierarchical timing level (see
+        ``gvrun.timing``): functional → untimed, timed → bandwidth,
+        cycle → beat (the latter only when ``width`` is set, else
+        bandwidth). An explicitly set kind always wins over the level.
+    synchronous : bool
+        Hint for v1 compatibility — the v2 sources do not actually read it.
+    shared_rw_channel : bool
+        ``True``  → single channel shared between read and write traffic
+        (R and W compete for the same per-cycle slot).
+        ``False`` (default) → two independent channels, doubling effective
+        throughput when traffic is balanced. Read by the bandwidth,
+        backpressure and beat variants.
+    max_input_pending_size : int
+        Per-input FIFO depth in bytes. Used by the beat variant.
+    bandwidth : int
+        Bytes per cycle the router can forward. Used by the bandwidth and
+        backpressure variants.
+    latency : int
+        Per-router latency in cycles, applied on every request on top of any
+        per-mapping latency. Used by the bandwidth and backpressure variants.
+    width : int
+        Beat width in bytes. Required by the beat variant (beats with
+        ``size > width`` are rejected as ``IO_RESP_INVALID``).
+    max_pending_bursts : int
+        Burst-table capacity. Used by the beat variant. ``0`` means "one slot
+        per input port".
+    nb_input_port : int
+        Number of input ports the router exposes. Grown on demand by
+        :meth:`Router.i_INPUT`.
+    mappings : list[RouterMapping]
+        Address mappings owned by this router. Populated via
+        :meth:`add_mappings` (or :meth:`Router.o_MAP` / :meth:`Router.add_mapping`).
+    """
+
+    kind: str = cfg_field(default=KIND_AUTO, dump=True, desc=(
+        "Router implementation flavour: 'untimed', 'bandwidth', 'backpressure', 'beat' or "
+        "'auto' (default). 'auto' picks the flavour matching the hierarchical timing level "
+        "(functional->untimed, timed->bandwidth, cycle->beat); an explicit kind always wins."
+    ))
+    synchronous: bool = cfg_field(default=True, dump=True, desc=(
+        "True if the router should use synchronous mode where all incoming requests are handled as "
+        "far as possible in synchronous IO mode."
+    ))
+    shared_rw_channel: bool = cfg_field(default=False, dump=True, desc=(
+        "True if the router has a single channel shared between read and write traffic "
+        "(reads and writes compete for the same per-cycle slot). False (default) gives two "
+        "independent channels, effectively doubling the router throughput when read and write "
+        "traffic is balanced."
+    ))
+    max_input_pending_size: int = cfg_field(default=0, dump=True, desc=(
+        "Size of the FIFO for each input. Only valid for asynchronous mode and only when input "
+        "packet size is smaller or equal to the bandwidth."
+    ))
+    bandwidth: int = cfg_field(default=0, dump=True, desc=(
+        "Global bandwidth, in bytes per cycle, applied to all incoming request. This impacts the "
+        "end time of the burst."
+    ))
+    latency: int = cfg_field(default=0, dump=True, desc=(
+        "Per-router latency in cycles applied to every request, on top of any per-mapping latency."
+    ))
+    width: int = cfg_field(default=0, dump=True, desc=(
+        "Beat width in bytes (only used by the beat-streaming variant)."
+    ))
+    max_pending_bursts: int = cfg_field(default=0, dump=True, desc=(
+        "Burst-table capacity (only used by the beat-streaming variant). Shared "
+        "across all inputs; ignored when max_pending_bursts_per_input is set."
+    ))
+    max_pending_bursts_per_input: int = cfg_field(default=0, dump=True, desc=(
+        "Per-input outstanding-burst budget (beat variant). When > 0, each input "
+        "independently allows up to this many in-flight bursts — the HW-faithful "
+        "shape, where each AXI master's ID-bounded outstanding is its own and no "
+        "shared pool can starve one input. The burst table is sized to hold all "
+        "inputs' budgets. When 0 (default), the single shared max_pending_bursts "
+        "table is used instead."
+    ))
+    nb_input_port: int = cfg_field(default=1, dump=True, desc=(
+        "Number of input ports the router exposes."
+    ))
+
+    mappings: list["RouterMapping"] = cfg_field(default_factory=list, init=False, desc=(
+        "List of address mappings for the router"
+    ))
+
+    def add_mappings(self, *mappings: "RouterMapping"):
+        for mapping in mappings:
+            mapping.adopt(self)
+            self.mappings.append(mapping)
+        return self
+
+    @property
+    def size(self):
+        min_addr = sys.maxsize
+        max_addr = 0
+        for mapping in self.mappings:
+            if not mapping.size:
+                continue
+            if mapping.base < min_addr:
+                min_addr = mapping.base
+            if mapping.base + mapping.size > max_addr:
+                max_addr = mapping.base + mapping.size
+        return max_addr - min_addr
+
+
+class Router(gvsoc.systree.Component):
+    """Address-decoding router on the io_v2 protocol.
+
+    Four implementations are available via the ``kind`` field on the
+    :class:`RouterConfig`:
+
+    By default (``kind='auto'``) the implementation is picked from the
+    hierarchical timing level (``name:timing=<level>`` in the target string,
+    ``timing.`` qualifiers or ``set_timing_level()``): functional → untimed,
+    timed → bandwidth, cycle → beat (when ``width`` is set).
+
+    - **'untimed'**: zero timing. Address decode + forward, nothing else. Fastest.
+      Use for pure functional simulation or when timing is modeled elsewhere.
+    - **'bandwidth'** (auto default at the 'timed' level): rate-limited, non-blocking. Requests are always
+      accepted; latency grows with the per-input/per-output bandwidth backlog and
+      is reported via ``req->latency`` (no ClockEvent scheduling). A master can
+      pipeline an arbitrary number of outstanding requests without handshaking.
+    - **'backpressure'**: rate-limited, blocking. Same bandwidth model, but the
+      router returns ``IO_REQ_DENIED`` while a previous request from the same input
+      is still in its delayed-forward window. The master must wait for ``retry()``.
+    - **'beat'**: beat-streaming, AXI-like. Each IoReq is one beat of size <=
+      ``width`` bytes. Bursts are tracked by ``burst_id`` (remapped through a
+      fixed per-router burst table). Multiple inputs compete for outputs via
+      round-robin arbitration with burst atomicity.
+
+    Which fields each kind actually reads:
+
+    .. csv-table::
+       :header: Field, untimed, bandwidth, backpressure, beat
+       :widths: auto
+
+       ``latency``,                –, yes, yes, –
+       ``bandwidth``,              –, yes, yes, –
+       ``shared_rw_channel``,      –, yes, yes, yes
+       ``width``,                  –, –,   –,   yes
+       ``max_input_pending_size``, –, –,   –,   yes
+       ``max_pending_bursts``,     –, –,   –,   yes
+       mapping ``max_pending_bursts``, –, –, –, yes
+
+    Fields not used by the selected kind are still packed into the compiled
+    config struct, but the C++ model simply ignores them.
+
+    Parameters
+    ----------
+    parent : gvsoc.systree.Component
+        Parent component this router is instantiated under.
+    name : str
+        Local name of the router within ``parent``. Used for component path,
+        traces, and as the lookup key for bindings.
+    config : RouterConfig
+        All router parameters live here. The instance is taken over by the
+        router — :meth:`add_mapping` / :meth:`o_MAP` append to its
+        ``mappings`` list and :meth:`i_INPUT` grows ``nb_input_port`` —
+        so each router needs its own ``RouterConfig``.
+    """
+
+    # Developer-manual doc registration. Discovered by AST scan at doc
+    # build time; the class docstring above is rendered via autoclass.
+    # Each tests_dirs entry declares the logical component id the tests
+    # target (matching ``testset.set_components(...)``) so the coverage
+    # lookup can find per-variant coverage when that producer ships.
+    __gvsoc_doc__ = {
+        'title': 'Router (v2)',
+        'tests_dirs': [
+            {'dir':       'gvsoc/core/tests/interco/router_untimed',
+             'component': 'interco.router_v2.untimed'},
+            {'dir':       'gvsoc/core/tests/interco/router_bandwidth',
+             'component': 'interco.router_v2.bandwidth'},
+            {'dir':       'gvsoc/core/tests/interco/router_backpressure',
+             'component': 'interco.router_v2.backpressure'},
+            {'dir':       'gvsoc/core/tests/interco/router_beat',
+             'component': 'interco.router_v2.beat'},
+        ],
+    }
+
+    def __init__(self, parent: gvsoc.systree.Component, name: str,
+                 config: RouterConfig):
+        if config.kind != KIND_AUTO and config.kind not in _SOURCES:
+            raise ValueError(
+                f"Router kind must be one of {list(_SOURCES) + [KIND_AUTO]}, "
+                f"got {config.kind!r}")
+
+        # ``config`` is owned by this router from now on: ``add_mapping`` /
+        # ``o_MAP`` will append to ``config.mappings`` and ``i_INPUT`` will
+        # grow ``config.nb_input_port``. Pass a fresh ``RouterConfig`` per
+        # router instance — sharing one template across several would mix
+        # their mappings and input-port counts.
+        self.config = config
+        super(Router, self).__init__(parent, name, config=self.config)
+
+        if config.kind == KIND_AUTO:
+            # The beat variant needs a beat width; without one the router
+            # can't do cycle-level streaming, so 'cycle' snaps to 'timed'.
+            supported = [gvrun.timing.FUNCTIONAL, gvrun.timing.TIMED]
+            if config.width > 0:
+                supported.append(gvrun.timing.CYCLE)
+            level = self.get_timing_level(supported=supported)
+            config.kind = _LEVEL_TO_KIND[level]
+            self.add_property('kind', config.kind)
+            self.add_property('timing_level', level)
+
+        sources = [_SOURCES[config.kind]]
+        self.add_sources(sources)
+
+    def add_mapping(self, name: str, base: int = 0, size: int = 0,
+                    remove_offset: int = 0, add_offset: int = 0, latency: int = 0,
+                    is_error: bool = False):
+        """Append a mapping entry to ``self.config.mappings``.
+
+        Lower-level than ``o_MAP``: only registers the mapping in the config,
+        does not bind any port. Use ``o_MAP`` instead when wiring an actual
+        downstream component — it calls this and then ``itf_bind`` together.
+
+        On every forwarded request, the router translates the address as
+        ``addr - remove_offset + add_offset`` before handing it to the
+        downstream port named ``name``.
+
+        Parameters
+        ----------
+        name : str
+            Mapping name. Also becomes the master port name on the C++ side
+            (must match the slave port the mapping is bound to). The literal
+            string ``"error"`` is recognised as the error mapping (any
+            request resolving to it is responded with ``IO_RESP_INVALID``).
+        base : int, optional
+            Start of the address range covered by this mapping.
+        size : int, optional
+            Range size in bytes. ``0`` means open-ended (the entry becomes
+            the catch-all "default" branch of the mapping tree).
+        remove_offset : int, optional
+            Subtracted from the request address before forwarding. Defaults
+            to 0; ``o_MAP(rm_base=True)`` sets this to ``base``.
+        add_offset : int, optional
+            Added to the request address before forwarding. Defaults to 0.
+        latency : int, optional
+            Per-mapping latency in cycles, added on top of the per-router
+            ``latency``. Used by ``'bandwidth'`` and ``'backpressure'``.
+        is_error : bool, optional
+            Marks this mapping as the error sink. ``True`` is also implied
+            when ``name == 'error'`` for backward compatibility.
+        """
+        self.config.add_mappings(RouterMapping(
+            name=name,
+            base=base,
+            size=size,
+            remove_offset=remove_offset,
+            add_offset=add_offset,
+            latency=latency,
+            is_error=is_error or name == 'error',
+        ))
+
+    def __alloc_input_port(self, id):
+        if id >= self.config.nb_input_port:
+            self.config.nb_input_port = id + 1
+
+    def i_INPUT(self, id: int = 0) -> gvsoc.systree.SlaveItf:
+        """Return a slave interface for input port ``id``.
+
+        Each call grows the router's input-port count if needed: the C++
+        side allocates ``cfg.nb_input_port`` slave ports at construction,
+        named ``input`` for id 0 and ``input_<N>`` for id >= 1.
+
+        Parameters
+        ----------
+        id : int, optional
+            Input port index, 0-based. Defaults to 0.
+
+        Returns
+        -------
+        gvsoc.systree.SlaveItf
+            The ``io_v2`` slave interface to bind a master output to.
+        """
+        self.__alloc_input_port(id)
+        # The beat kind consumes per-beat io_v2 traffic on its inputs; declare
+        # IoV2Beat so a beat master (e.g. the cluster DMA ext port) binds
+        # directly with no auto-inserted IoV2BeatAdapter. A legacy 'io_v2'
+        # string master still binds directly too (the framework only bridges
+        # when the master side is a class-based Signature). Other kinds keep
+        # the legacy string signature.
+        sig = IoV2Beat(self.config.width) if self.config.kind == KIND_BEAT else IoV2SingleReq()
+        name = 'input' if id == 0 else f'input_{id}'
+        return gvsoc.systree.SlaveItf(self, name, signature=sig)
+
+    def o_MAP(self, itf: gvsoc.systree.SlaveItf, mapping: RouterMapping,
+              name: str = None):
+        """Attach a :class:`RouterMapping` to this router and bind a master
+        output port to ``itf``.
+
+        ``mapping`` is taken over by the router: it is appended to
+        ``self.config.mappings`` and adopted as a child of the config, so a
+        fresh ``RouterMapping`` must be passed for each ``o_MAP`` call.
+        The master port name on the C++ side is ``mapping.name`` after this
+        call returns (possibly overridden by the ``name`` kwarg or defaulted
+        to ``itf.component.name``).
+
+        Parameters
+        ----------
+        itf : gvsoc.systree.SlaveItf
+            Downstream slave interface to bind to.
+        mapping : RouterMapping
+            All mapping parameters live here (``base``, ``size``,
+            ``remove_base``, ``remove_offset``, ``add_offset``, ``latency``,
+            ``is_error``).
+        name : str, optional
+            Override for ``mapping.name``. When neither this kwarg nor
+            ``mapping.name`` was set, the binding defaults to
+            ``itf.component.name``.
+        """
+        if name is not None:
+            mapping.name = name
+        elif not mapping.name:
+            mapping.name = itf.component.name
+        if mapping.remove_base and mapping.remove_offset == 0:
+            mapping.remove_offset = mapping.base
+        if mapping.name == 'error':
+            mapping.is_error = True
+        self.config.add_mappings(mapping)
+        # The beat kind produces per-beat responses on its outputs; declare
+        # IoV2Beat so the framework auto-inserts an IoV2BeatAdapter when the
+        # downstream slave uses a non-beat io_v2 signature. Other kinds route
+        # responses by request identity and so handle only single-beat
+        # responses: declare IoV2SingleReq, which binds directly to other
+        # single-req / big-packet / sync slaves and makes the framework
+        # auto-insert a collapse converter if the downstream is a beat slave
+        # (a multi-beat stream this router could not route back).
+        if self.config.kind == KIND_BEAT:
+            self.itf_bind(mapping.name, itf, signature=IoV2Beat(self.config.width))
+        else:
+            self.itf_bind(mapping.name, itf, signature=IoV2SingleReq())
+
+    def o_MAP_DEFAULT(self, itf: gvsoc.systree.SlaveItf, name: str = None,
+                      latency: int = 0, is_error: bool = False):
+        """Attach a catch-all (``size=0``) mapping to this router and bind it.
+
+        Convenience wrapper over :meth:`o_MAP` that builds a fresh
+        :class:`RouterMapping` with ``size=0`` (the v2 catch-all encoding) and
+        forwards it to ``itf``. Useful for the "anything not matched by an
+        explicit window goes here" branch — every router needs its own fresh
+        mapping instance, so this method must be called per binding rather
+        than reusing a shared ``RouterMapping`` variable.
+
+        Parameters
+        ----------
+        itf : gvsoc.systree.SlaveItf
+            Downstream slave interface to bind to.
+        name : str, optional
+            Mapping / port name override. Defaults to
+            ``itf.component.name`` if unset.
+        latency : int, optional
+            Per-mapping latency in cycles, applied on top of the per-router
+            ``latency``. Used by ``'bandwidth'`` and ``'backpressure'``.
+        is_error : bool, optional
+            Marks this mapping as the error sink — requests resolving to it
+            are responded with ``IO_RESP_INVALID``.
+        """
+        self.o_MAP(itf, mapping=RouterMapping(
+            size=0, latency=latency, is_error=is_error), name=name)
+
+    def gen_gui(self, parent_signal):
+        """Surface per-mapping address / size traces in the GUI.
+
+        For most router kinds, each mapping has a ``<name>/addr`` /
+        ``<name>/size`` signal pair from the C++ model.
+
+        The ``beat`` kind further splits each mapping into ``req/*`` (every
+        outgoing forward — read setup reqs and per-beat writes, plus an
+        ``is_write`` discriminator) and ``resp/*`` (per-beat read responses
+        coming back upstream), and exposes explicit ``active`` busy bits
+        (pulsed for one cycle on each access) at both the router and
+        per-mapping levels so the corresponding rows render as ACTIVE
+        strips in the timeline.
+        """
+        import gvsoc.gui
+
+        if self.config.kind == KIND_BEAT:
+            top = gvsoc.gui.Signal(self, parent_signal, name=self.name,
+                path="active", groups=['regmap', 'active'],
+                display=gvsoc.gui.DisplayLogicBox('ACTIVE'))
+        else:
+            top = gvsoc.gui.SignalGenFromSignals(self, parent_signal,
+                to_signal=self.name, mode="combined",
+                from_groups=["active"], groups=["regmap", "active"],
+                display=gvsoc.gui.DisplayLogicBox('ACTIVE'),
+                skip_if_no_child=True)
+
+        for mapping in self.config.mappings:
+            mname = mapping.name or 'mapping'
+
+            if self.config.kind == KIND_BEAT:
+                # Per-mapping busy bit — driven by the C++ model on every
+                # log_access / log_resp for this output port. The row in the
+                # timeline shows an ACTIVE strip independently of req/resp
+                # expansion.
+                mapping_trace = gvsoc.gui.Signal(self, top, mname,
+                    path=mname + "/active", groups=['regmap', 'active'],
+                    display=gvsoc.gui.DisplayLogicBox('ACTIVE'))
+                req_trace = gvsoc.gui.Signal(self, mapping_trace, "req",
+                    path=mname + "/req/addr", groups=['regmap', 'active'])
+                gvsoc.gui.Signal(self, req_trace, "size",
+                    path=mname + "/req/size", groups=['regmap'])
+                gvsoc.gui.Signal(self, req_trace, "is_write",
+                    path=mname + "/req/is_write", groups=['regmap'])
+                gvsoc.gui.Signal(self, req_trace, "is_first",
+                    path=mname + "/req/is_first", groups=['regmap'])
+                gvsoc.gui.Signal(self, req_trace, "is_last",
+                    path=mname + "/req/is_last", groups=['regmap'])
+                resp_trace = gvsoc.gui.Signal(self, mapping_trace, "resp",
+                    path=mname + "/resp/addr", groups=['regmap', 'active'])
+                gvsoc.gui.Signal(self, resp_trace, "size",
+                    path=mname + "/resp/size", groups=['regmap'])
+                gvsoc.gui.Signal(self, resp_trace, "is_first",
+                    path=mname + "/resp/is_first", groups=['regmap'])
+                gvsoc.gui.Signal(self, resp_trace, "is_last",
+                    path=mname + "/resp/is_last", groups=['regmap'])
+            else:
+                mapping_trace = gvsoc.gui.Signal(self, top, mname,
+                    path=mname + "/addr", groups=['regmap', 'active'])
+                gvsoc.gui.Signal(self, mapping_trace, "size",
+                    path=mname + "/size", groups=['regmap'])

@@ -52,9 +52,20 @@
 #define REG64_SET(reg,val) iss->regfile.set_reg_pair(insn->out_regs[reg], val)
 
 #define FREG32_GET(reg) (iss->regfile.get_freg(insn->in_regs[reg]))
+// Default-width FP read/write. With Zdinx the "default" is a 64-bit
+// pair (low/high 32-bit halves of the FP value live in regs `r` and
+// `r+1`). Without Zdinx it is a single 32-bit value. FREG32_* always
+// stays 32-bit so single-precision FP ops in mixed Zfinx/Zdinx mode
+// don't accidentally clobber `r+1`.
+#if defined(CONFIG_GVSOC_ISS_ZDINX)
+#define FREG_GET(reg) REG64_GET(reg)
+#define FREG_OUT_GET(reg) iss->regfile.get_reg_pair(insn->out_regs[reg])
+#define FREG_SET(reg,val) REG64_SET(reg, val)
+#else
 #define FREG_GET(reg) (iss->regfile.get_freg(insn->in_regs[reg]))
 #define FREG_OUT_GET(reg) (iss->regfile.get_freg(insn->out_regs[reg]))
-#define FREG32_SET(reg,val) (iss->regfile.set_freg(insn->out_regs[reg], val))
 #define FREG_SET(reg,val) (iss->regfile.set_freg(insn->out_regs[reg], val))
+#endif
+#define FREG32_SET(reg,val) (iss->regfile.set_freg(insn->out_regs[reg], val))
 
 #endif

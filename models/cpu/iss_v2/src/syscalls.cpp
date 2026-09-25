@@ -26,7 +26,6 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <vp/itf/io.hpp>
 #include <vp/stats/stats_engine.hpp>
 
 #ifndef O_BINARY
@@ -49,7 +48,6 @@ Syscalls::Syscalls(Iss &iss)
 void Syscalls::reset(bool active)
 {
   this->htif.reset(active);
-  this->latency = 0;
 }
 
 
@@ -111,42 +109,22 @@ void Syscalls::handle_ebreak()
 
 bool Syscalls::user_access(iss_addr_t addr, uint8_t *buffer, iss_addr_t size, bool is_write)
 {
-    vp::IoReq *req = &this->iss.lsu.debug_req;
-    std::string str = "";
-    while (size != 0)
+    // Go through the same debug-memory backdoor as the gdbserver. The access
+    // is zero-time and works also with buffering io_v2 interconnects, which
+    // cannot serve debug requests on the data port.
+    vp::DebugMemIf *debug_mem = this->iss.gdbserver.debug_mem;
+    if (debug_mem == nullptr)
     {
-        req->init();
-        req->set_debug(true);
-        req->set_addr(addr);
-        req->set_size(1);
-        req->set_is_write(is_write);
-        req->set_data(buffer);
-        int err = this->iss.lsu.data.req(req);
-        if (err != vp::IO_REQ_OK)
-        {
-            if (err == vp::IO_REQ_INVALID)
-            {
-                this->trace.fatal("Invalid IO response during debug request (addr: 0x%lx, size: 0x%lx)\n",
-                    addr, size);
-            }
-            else
-            {
-                this->trace.fatal("Pending IO response during debug request (addr: 0x%lx, size: 0x%lx)\n",
-                    addr, size);
-            }
+        this->trace.force_warning("Semi-hosting access without debug-memory backdoor"
+            " (addr: 0x%lx, size: 0x%lx)\n", addr, size);
+        return true;
+    }
 
-            return true;
-        }
-
-        int64_t latency = req->get_full_latency();
-        if (latency > this->latency)
-        {
-            this->latency = latency;
-        }
-
-        addr++;
-        size--;
-        buffer++;
+    if (debug_mem->debug_mem_access(addr, buffer, size, is_write))
+    {
+        this->trace.fatal("Invalid access during semi-hosting request (addr: 0x%lx, size: 0x%lx)\n",
+            addr, size);
+        return true;
     }
 
     return false;
@@ -154,24 +132,22 @@ bool Syscalls::user_access(iss_addr_t addr, uint8_t *buffer, iss_addr_t size, bo
 
 std::string Syscalls::read_user_string(iss_addr_t addr, int size)
 {
-    vp::IoReq *req = &this->iss.lsu.debug_req;
+    // Same debug-memory backdoor as the gdbserver, see user_access
+    vp::DebugMemIf *debug_mem = this->iss.gdbserver.debug_mem;
+    if (debug_mem == nullptr)
+    {
+        this->trace.force_warning("Semi-hosting access without debug-memory backdoor"
+            " (addr: 0x%lx)\n", addr);
+        return "";
+    }
+
     std::string str = "";
     while (size != 0)
     {
         uint8_t buffer;
-        req->init();
-        req->set_debug(true);
-        req->set_addr(addr);
-        req->set_size(1);
-        req->set_is_write(false);
-        req->set_data(&buffer);
-        int err = this->iss.lsu.data.req(req);
-        if (err != vp::IO_REQ_OK)
+        if (debug_mem->debug_mem_access(addr, &buffer, 1, false))
         {
-            if (err == vp::IO_REQ_INVALID)
-                return "";
-            else
-                this->trace.fatal("Pending IO response during debug request\n");
+            return "";
         }
 
         if (buffer == 0)
@@ -204,7 +180,6 @@ static const int open_modeflags[12] = {
 void Syscalls::handle_riscv_ebreak()
 {
     int id = this->iss.regfile.get_reg_untimed(10);
-    this->latency = 0;
 
     switch (id)
     {
@@ -266,10 +241,19 @@ void Syscalls::handle_riscv_ebreak()
                 return;
             }
 
-            if (write(args[0], (void *)(long)buffer, iter_size) != iter_size)
-                break;
+            if (args[0] == 1 || args[0] == 2)
+            {
+                // stdout / stderr: route through the always-on console channel so the output can
+                // also be captured by the GUI, tagged with time + core path.
+                this->iss.stdout_write((char *)buffer, iter_size);
+            }
+            else
+            {
+                if (write(args[0], (void *)(long)buffer, iter_size) != iter_size)
+                    break;
 
-            fsync(args[0]);
+                fsync(args[0]);
+            }
 
             size -= iter_size;
             addr += iter_size;
@@ -335,7 +319,8 @@ void Syscalls::handle_riscv_ebreak()
             this->iss.regfile.set_reg(10, -1);
             return;
         }
-        putchar(args[0]);
+        char c = (char)args[0];
+        this->iss.stdout_write(&c, 1);
         break;
     }
 
@@ -743,23 +728,35 @@ void Syscalls::handle_riscv_ebreak()
         break;
     }
 
-    // case 0x114:
-    // {
-    //     this->iss.regfile.set_reg(10, this->iss.memcheck.mem_alloc(
-    //       this->iss.regfile.get_reg_untimed(11), this->iss.regfile.regs[12],
-    //       this->iss.regfile.get_reg_untimed(13)));
+    case 0x114:
+    {
+        this->iss.regfile.set_reg(10, this->iss.memcheck.mem_alloc(
+            this->iss.regfile.get_reg_untimed(11), this->iss.regfile.get_reg_untimed(12),
+            this->iss.regfile.get_reg_untimed(13)));
 
-    //     break;
-    // }
+        break;
+    }
 
-    // case 0x115:
-    // {
-    //     this->iss.regfile.set_reg(10, this->iss.memcheck.mem_free(this->iss.regfile.get_reg_untimed(11),
-    //       this->iss.regfile.get_reg_untimed(12),
-    //       this->iss.regfile.get_reg_untimed(13)));
+    case 0x115:
+    {
+        this->iss.regfile.set_reg(10, this->iss.memcheck.mem_free(
+            this->iss.regfile.get_reg_untimed(11), this->iss.regfile.get_reg_untimed(12),
+            this->iss.regfile.get_reg_untimed(13)));
 
-    //     break;
-    // }
+        break;
+    }
+
+    // The runtime declares the application is starting: re-arm the register
+    // shadow, so that what ran before -- a boot ROM initializing every register,
+    // then spilled onto the application stack -- does not pass for initialized
+    // data. Memory already written stays initialized, which is correct.
+    case 0x11B:
+    {
+#ifdef VP_MEMCHECK_ACTIVE
+        this->iss.regfile.memcheck_reset();
+#endif
+        break;
+    }
 
     // case 0x116:
     // {
@@ -774,6 +771,15 @@ void Syscalls::handle_riscv_ebreak()
     //   }
     //   break;
     // }
+
+    case 0x11A:  // SEMIHOSTING_GV_STACK_SET
+    {
+#if defined(CONFIG_GVSOC_ISS_STACK_CHECKER)
+        this->iss.regfile.stack_set(this->iss.regfile.get_reg_untimed(11),
+            this->iss.regfile.get_reg_untimed(12));
+#endif
+        break;
+    }
 
     case 0x117:  // SEMIHOSTING_GV_STATS_START
     {
@@ -808,11 +814,6 @@ void Syscalls::handle_riscv_ebreak()
     default:
         this->trace.force_warning("Unknown ebreak call (id: %d)\n", id);
         break;
-    }
-
-    if (this->latency > 0)
-    {
-        this->iss.timing.stall_load_account(this->latency);
     }
 }
 

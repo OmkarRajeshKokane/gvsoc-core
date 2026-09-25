@@ -24,7 +24,11 @@
 // MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
 
 #include <vp/vp.hpp>
+#ifdef CONFIG_GVSOC_ISS_LSU_V2
+#include <vp/itf/io_v2.hpp>
+#else
 #include <vp/itf/io.hpp>
+#endif
 #include <stdio.h>
 #include <math.h>
 #include <unistd.h>
@@ -92,7 +96,6 @@ void Htif::build()
 
 void Htif::data_response(vp::Block *__this, vp::IoReq *req)
 {
-
 }
 
 

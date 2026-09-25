@@ -44,14 +44,30 @@ public:
     void flush();
     iss_insn_t *get_insn_from_cache(iss_reg_t vaddr);
     inline iss_insn_t *get_insn(iss_reg_t vaddr);
+    // Get an instruction from its physical address (the insn addr field), without
+    // going through the virtual-address translation. Used to retrieve held
+    // instructions (InsnEntry) whose addr is physical.
+    iss_insn_t *get_insn_phys(iss_reg_t paddr);
     void mode_flush();
     inline void insn_init(iss_insn_t *insn, iss_addr_t addr);
     InsnPage *page_get(iss_reg_t paddr);
+
+    // Take ownership of a macro-instruction expansion table, so that it is
+    // freed with the rest of the cache on a flush. The table must come from
+    // new[], as the flush deletes it that way.
+    inline void register_insn_table(iss_insn_t *table);
+
+    // Bumped on every flush (full or mode flush). Consumers caching
+    // pointers into the pages (e.g. the DBT translation cache) compare
+    // it to detect that their cached state went stale.
+    int generation = 0;
 
 
 private:
     InsnPage *current_insn_page;
     iss_reg_t current_insn_page_base;
+    InsnPage *current_phys_page;
+    iss_reg_t current_phys_page_base;
     std::unordered_map<iss_reg_t, InsnPage *>pages;
     std::vector<iss_insn_t *> insn_tables;
 
@@ -59,6 +75,11 @@ private:
 };
 
 
+
+inline void InsnCache::register_insn_table(iss_insn_t *table)
+{
+    this->insn_tables.push_back(table);
+}
 
 inline iss_insn_t *InsnCache::get_insn(iss_reg_t vaddr)
 {
