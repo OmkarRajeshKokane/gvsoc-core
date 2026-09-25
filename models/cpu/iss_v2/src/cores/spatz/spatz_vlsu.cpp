@@ -395,15 +395,18 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
     if (_this->nb_pending_insn.get() == 0)
     {
         uint8_t zero = 0;
+
         _this->event_queue.event_highz();
         _this->event_pc.event_highz();
         _this->event_active.event(&zero);
+
         for (int i=0; i<_this->nb_ports; i++)
         {
             _this->event_addr[i].event_highz();
             _this->event_size[i].event_highz();
             _this->event_is_write[i].event(&zero);
         }
+
         _this->event_label.dump_highz();
 
         _this->fsm_event.disable();
@@ -415,7 +418,9 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
     // - and is ready dependency-wise.
     if (_this->nb_waiting_insn > 0 && _this->pending_size == 0)
     {
-        VuLsuPendingInsn &slot = _this->insns[_this->insn_first_waiting];
+        VuLsuPendingInsn &slot =
+            _this->insns[_this->insn_first_waiting];
+
         PendingInsn *pending_insn = slot.insn;
         iss_insn_t *insn = _this->vu.iss.exec.get_insn(pending_insn->entry);
 
@@ -493,11 +498,17 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
         {
             iss_insn_t *insn = _this->vu.iss.exec.get_insn(pending_insn->entry);
 
-            if (!_this->started)
+            // Start timing once
+            if (pending_insn->exec_start_cycle < 0)
             {
-                _this->started = true;
-                _this->event_label.dump(insn->desc->label);
-                _this->event_pc.event((uint8_t *)&insn->addr);
+                pending_insn->exec_start_cycle =
+                    _this->vu.iss.clock.get_cycles();
+
+                _this->event_label.dump(
+                    insn->desc->label);
+
+                _this->event_pc.event(
+                    (uint8_t *)&insn->addr);
             }
 
             for (int i=0; i<_this->ports.size(); i++)
@@ -532,7 +543,9 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                     }
                     else
                     {
-                        size = std::min((iss_addr_t)_this->vu.lane_width, _this->pending_size);
+                        size = std::min(
+                            (iss_addr_t)_this->vu.lane_width,
+                            _this->pending_size);
                     }
 
                     _this->trace.msg(vp::Trace::LEVEL_TRACE,
@@ -582,8 +595,11 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                     req->arg_push((void *)&rob_entry);
 
                     req->set_addr(addr);
-                    req->set_is_write(_this->pending_is_write);
+                    req->set_is_write(
+                        _this->pending_is_write);
                     req->set_size(size);
+                    req->set_data(
+                        _this->pending_velem);
 
                     slot.nb_pending_bursts++;
                     _this->vstart += size / _this->elem_size;

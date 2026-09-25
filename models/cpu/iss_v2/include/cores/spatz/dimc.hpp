@@ -8,8 +8,8 @@
 #define VRF_size 256
 #define FB_LEN 1
 #define FB_EW 256*4/8
-#define OP_LEN 32/4 // reduced due to bandwidth 
-  
+#define OP_LEN 32/4 // reduced due to bandwidth
+
 class DIMC
 {
 public:
@@ -17,7 +17,7 @@ public:
 
     void build();
     void reset(bool reset);
-    
+
     void move_KB();
     void move_FB();
     void dimc_compute_row();
@@ -34,7 +34,14 @@ public:
     int kmc_row_count=0;
     int kmc_block_count=0;
     int fmc_block_count=0;
+    int Chunk_Size=512;
 
+    bool Kernel_load = 0;
+    int Move_delay = 0;
+    bool Feature_reuse = 0;
+    bool Feature_load_flag=1;
+
+    int instrucn_call=0;
     int row_sel=0;
     bool burst_mode_compute=0;
     //bool FLC [FB_EW/VRF_size]; // Feature load Filled/ Complete

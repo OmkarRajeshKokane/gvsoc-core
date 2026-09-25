@@ -106,6 +106,9 @@ Csr::Csr(Iss &iss)
 #if defined(CONFIG_ISS_HAS_VECTOR)
     this->declare_csr(&this->vlenb,  "vlenb",  0xC22, CONFIG_ISS_VLEN/8);
 #endif
+    this->declare_csr(&this->dimc_kernel, "dimc_kernel", 0x7D3);
+    this->declare_csr(&this->dimc_feature_reuse, "dimc_feature_reuse", 0x7D4);
+    this->declare_csr(&this->dimc_compute_reuse, "dimc_compute_reuse", 0x7D5);
 #if defined(CONFIG_GVSOC_ISS_PMP)
     // Machine protection and translation
     for (int i=0; i<16; i++)
@@ -1665,6 +1668,12 @@ const char *iss_csr_name(Iss *iss, iss_reg_t reg)
     case CSR_STACK_END:
         return "stack_end";
 #endif
+    case CSR_DIMC_KERNEL:
+        return "dimc_kernel";
+    case CSR_DIMC_FEATURE_REUSE:
+        return "dimc_feature_reuse";
+    case CSR_DIMC_COMPUTE_REUSE:
+        return "dimc_compute_reuse";
     }
 
 #if defined(ISS_HAS_PERF_COUNTERS)

@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <cstdlib>
+
 #ifdef CONFIG_GVSOC_ISS_V2
 #define VSTART iss->arch.vu.vstart
 #define VEND iss->arch.vu.vend
@@ -42,6 +44,12 @@
 static inline iss_reg_t vlmax_get(Iss *iss)
 {
     return CONFIG_ISS_VLEN / 8 * iss->vector.lmul / iss->vector.sewb;
+}
+
+static inline bool dimc_optimized_enabled()
+{
+    const char *env = std::getenv("VMVM_DIMC_OPTIMIZED");
+    return env == nullptr || env[0] == '\0' || env[0] != '0';
 }
 
 static inline void extract_format(int sew, uint8_t *m, uint8_t *e){
@@ -2346,8 +2354,10 @@ static inline iss_reg_t vfslide1up_vf_exec(Iss *iss, iss_insn_t *insn, iss_reg_t
     return iss_insn_next(iss, insn, pc);
 }
 
+
 static inline iss_reg_t sf_vqmmacc_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
+    bool optimized = dimc_optimized_enabled();
     unsigned int sewb = iss->vector.sewb;
     unsigned int lmul = iss->vector.lmul;
     const int vd_reg = REG_OUT(0);
@@ -2356,28 +2366,74 @@ static inline iss_reg_t sf_vqmmacc_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc
     const int vs2_reg = UIM_GET(1) * 8;
 
     unsigned int max_vl = iss->csr.vl.value;
+    int timing=0;
 
-    for (unsigned int i = iss->csr.vstart.value; i < max_vl; i++)
-    {
-        iss->arch.dimc.FB[i] = velem_get_value(iss, vs1_reg, i, sewb, lmul);
-    }
-    iss->arch.dimc.move_FB();
+    const bool feature_load_now = iss->csr.dimc_feature_reuse.value == 0;
 
-    for (unsigned int j = vs2_reg; j < (vs2_reg + 8); j++)
+    if (feature_load_now)
     {
         for (unsigned int i = iss->csr.vstart.value; i < max_vl; i++)
         {
-            iss->arch.dimc.KB[j][i] = velem_get_value(iss, j, i, sewb, lmul);
+            iss->arch.dimc.FB[i] = velem_get_value(iss, vs1_reg, i, sewb, lmul);
         }
-        iss->arch.dimc.move_KB();
+        for (unsigned int i = max_vl; i < sizeof(iss->arch.dimc.FB); i++)
+        {
+            iss->arch.dimc.FB[i] = 0;
+        }
+
+        iss->arch.dimc.move_FB();
+    }
+    if (!optimized || feature_load_now)
+    {
+        timing += 3+ (max_vl * 8 / iss->arch.dimc.Chunk_Size);
     }
 
+    const bool kernel_load_now = iss->csr.dimc_kernel.value != 0;
+
+    if (kernel_load_now)
+    {
+        if (iss->arch.dimc.Kernel_load)
+        {
+            iss->arch.dimc.Kernel_load = false;
+            iss->csr.dimc_kernel.value = 0;
+        }
+        else
+        {
+            iss->arch.dimc.Kernel_load = true;
+        }
+    }
+
+    if (!optimized || kernel_load_now)
+    {
+        timing +=8*max_vl*8/iss->arch.dimc.Chunk_Size;
+    }
+
+    if (kernel_load_now)
+    {
+        for (unsigned int j = vs2_reg; j < (vs2_reg + 8); j++)
+        {
+            for (unsigned int i = iss->csr.vstart.value; i < max_vl; i++)
+            {
+                iss->arch.dimc.KB[j][i] = velem_get_value(iss, j, i, sewb, lmul);
+            }
+            for (unsigned int i = max_vl; i < sizeof(iss->arch.dimc.KB[j]); i++)
+            {
+                iss->arch.dimc.KB[j][i] = 0;
+            }
+            iss->arch.dimc.move_KB();
+        }
+
+
+    }
     iss->arch.dimc.Ci = ci;
     for (unsigned int j = vs2_reg; j < (vs2_reg + 8); j++)
     {
         iss->arch.dimc.row_sel = j;
         iss->arch.dimc.compute_PP();
+
     }
+
+    timing +=  8;
 
     int shift = (ci > 3) ? 8 : 0;
     for (int j = 0; j < 8; j++)
@@ -2385,6 +2441,81 @@ static inline iss_reg_t sf_vqmmacc_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc
         velem_set_value(iss, vd_reg, j + shift, 4, iss->arch.dimc.OP_buffer[j]);
     }
 
+
+
+    //printf("the timing of this instruction is %d \n",timing );
+    iss->arch.dimc.instrucn_call++;
+    iss->arch.dimc.Move_delay =timing;
+    return iss_insn_next(iss, insn, pc);
+}
+
+static inline iss_reg_t sf_vqmmacc16_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
+{
+
+    bool optimized = dimc_optimized_enabled();
+    unsigned int sewb = iss->vector.sewb;
+    unsigned int lmul = iss->vector.lmul;
+    const int vd_reg = REG_OUT(0);
+    const int vs1_reg = REG_IN(0);
+    const int ci = UIM_GET(0);
+    const int vs2_reg = UIM_GET(1) * 8;
+    int timing=0;
+
+    unsigned int max_vl = iss->csr.vl.value;
+    int32_t partial_sums[16];
+
+
+
+    for (unsigned int i = iss->csr.vstart.value; i < max_vl; i++)
+    {
+        iss->arch.dimc.FB[i] = velem_get_value(iss, vs1_reg, i, sewb, lmul);
+    }
+    timing += max_vl * 8 / iss->arch.dimc.Chunk_Size;
+
+    //timing+= max_vl*8/256;
+    iss->arch.dimc.move_FB();
+
+
+    const bool kernel_load_now = iss->csr.dimc_kernel.value != 0;
+    iss->arch.dimc.Kernel_load = kernel_load_now;
+
+    if (!optimized || kernel_load_now)
+    {
+        timing+=16*max_vl*8/iss->arch.dimc.Chunk_Size;
+    }
+
+    if (kernel_load_now)
+    {
+        for (unsigned int j = vs2_reg; j < (vs2_reg + 16); j++)
+        {
+            for (unsigned int i = iss->csr.vstart.value; i < max_vl; i++)
+            {
+                iss->arch.dimc.KB[j][i] = velem_get_value(iss, j, i, sewb, lmul);
+            }
+            iss->arch.dimc.move_KB();
+        }
+
+        iss->csr.dimc_kernel.value = 0;
+    }
+
+
+    iss->arch.dimc.Ci = ci;
+    for (unsigned int j = vs2_reg; j < (vs2_reg + 16); j++)
+    {
+        iss->arch.dimc.row_sel = j;
+        iss->arch.dimc.compute_PP();
+        partial_sums[j - vs2_reg] = iss->arch.dimc.partial_sums;
+    }
+    timing += 3 + 16;
+
+
+    for (int j = 0; j < 16; j++)
+    {
+        velem_set_value(iss, vd_reg, j, 4, partial_sums[j]);
+    }
+    iss->arch.dimc.Move_delay = timing;
+    //iss->arch.dimc.Move_delay = timing;
+    //printf("the timing move of this instruction is %d and the vmax is %d and condition mod is %d and the kernel load state is %d\n ",iss->arch.dimc.Move_delay, max_vl,(iss->arch.dimc.instrucn_call)%iss->csr.dimc_kernel.value , iss->arch.dimc.Kernel_load);
     return iss_insn_next(iss, insn, pc);
 }
 

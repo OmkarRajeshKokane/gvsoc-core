@@ -21,11 +21,34 @@
 #pragma once
 
 #include <queue>
+#include <array>
+#include <vector>
 #include <cpu/iss_v2/include/types.hpp>
 #include <cpu/iss_v2/include/stats/insn_duration.hpp>
 #include <vp/clock/clock_event.hpp>
 #include <vp/register.hpp>
+#include <cstring>
+#include <map>
+#include <set>
+#include <string>
 
+static std::set<std::string> seen;
+extern uint64_t sf_vqmmacc_count;
+extern uint64_t sf_vqmmacc16_count;
+extern uint64_t vle_count;
+extern uint64_t vse_count;
+extern uint64_t other_count;
+
+extern uint64_t queue_depth_sum;
+extern uint64_t queue_depth_samples;
+extern uint64_t queue_depth_max;
+
+extern uint64_t vu_busy_cycles;
+extern uint64_t sf_vqmmacc_cycles;
+extern uint64_t sf_vqmmacc16_cycles;
+extern uint64_t vle_cycles;
+extern uint64_t vse_cycles;
+extern uint64_t other_cycles;
 class Vu;
 class IssWrapper;
 class PendingInsn;
@@ -75,6 +98,15 @@ public:
     // drained (the release also gates WAW/WAR, which the RTL frees
     // per-word).
     int64_t chain_release_cycle;
+    bool has_dimc_csr_snapshot = false;
+    uint64_t dimc_kernel_csr = 0;
+    uint64_t dimc_feature_reuse_csr = 0;
+    uint64_t dimc_compute_reuse_csr = 0;
+    uint64_t queue_enter_cycle = 0;
+    uint64_t complete_cycle = 0;
+    uint64_t profile_id = 0;
+    uint64_t profile_start_cycle = 0;
+    const char *profile_label = nullptr;
 };
 
 // This represents a generic HW block where vector instructions can be forwarded
@@ -660,6 +692,34 @@ class Vu : public vp::Block
     friend class VuLsu;
 
 public:
+    enum VmvmProfileCategory
+    {
+        vmvm_profile_sfvqmmacc = 1,
+        vmvm_profile_load = 2,
+        vmvm_profile_store = 3,
+        vmvm_profile_vfadd = 4,
+        vmvm_profile_vsetvli = 5,
+        vmvm_profile_dma_wait_all = 6
+    };
+
+    struct VmvmProfileInterval
+    {
+        uint64_t start;
+        uint64_t end;
+        std::string label;
+        int fixed_priority;
+    };
+
+    struct VmvmBoundaryEvent
+    {
+        uint64_t pc;
+        uint64_t cycle;
+    };
+
+    bool profile_dumped = false;
+    void dump_profile();
+    void vmvm_profile_marker(uint64_t marker);
+    void vmvm_profile_scalar_instruction(iss_insn_t *insn, uint64_t cycle);
     // List of sub-blocks processing instructions
     typedef enum
     {
@@ -693,6 +753,10 @@ public:
     inline uint64_t current_insn_reg_2_get() { return current_insn_reg_2; }
 
     void dump_regs_to_trace(iss_insn_t *insn, PendingInsn *pending_insn, int nb_elem, bool is_out);
+    bool dimc_csr_snapshot_apply(PendingInsn *pending_insn, uint64_t &dimc_kernel_csr,
+        uint64_t &dimc_feature_reuse_csr, uint64_t &dimc_compute_reuse_csr);
+    void dimc_csr_snapshot_restore(bool applied, uint64_t dimc_kernel_csr,
+        uint64_t dimc_feature_reuse_csr, uint64_t dimc_compute_reuse_csr);
     inline void exec_insn_chunk(iss_insn_t *insn, PendingInsn *pending_insn, int vstart,
         int vend, int nb_elem);
 
@@ -719,8 +783,26 @@ public:
     void insn_handle_reduction();
 
 private:
+    void vmvm_profile_add_interval(iss_insn_t *insn, uint64_t start, uint64_t end);
+    void vmvm_profile_add_named_interval(const char *label, int fixed_priority,
+        uint64_t start, uint64_t end);
+    static int vmvm_profile_fixed_priority(iss_insn_t *insn);
+    void vmvm_profile_dump(uint64_t end_cycle);
+
+    bool vmvm_profile_active = false;
+    bool vmvm_profile_dma_wait_active = false;
+    uint64_t vmvm_profile_start_cycle = 0;
+    uint64_t vmvm_profile_dma_wait_start = 0;
+    std::vector<VmvmProfileInterval> vmvm_profile_intervals;
+    std::vector<uint64_t> vmvm_boundary_pcs;
+    std::vector<VmvmBoundaryEvent> vmvm_boundary_events;
+    std::string vmvm_boundary_output_path;
+    uint64_t vmvm_boundary_last_scalar_pc = UINT64_MAX;
+
     void insn_commit(PendingInsn *pending_insn);
     static iss_reg_t vector_insn_stub_handler(Iss *iss, iss_insn_t *insn, iss_reg_t pc);
+    static bool is_dimc_insn(iss_insn_t *insn);
+    uint32_t input_vreg_mask(iss_insn_t *insn, PendingInsn *pending_insn);
 
     static iss_reg_t load_store_handler(Iss *iss, iss_insn_t *insn, iss_reg_t pc);
     // Handler for internal FSM
@@ -806,7 +888,15 @@ inline void Vu::exec_insn_chunk(iss_insn_t *insn, PendingInsn *pending_insn, int
     this->dump_regs_to_trace(insn, pending_insn, nb_elem, false);
 #endif
 
+    uint64_t dimc_kernel_csr = 0;
+    uint64_t dimc_feature_reuse_csr = 0;
+    uint64_t dimc_compute_reuse_csr = 0;
+    bool dimc_csr_snapshot_applied =
+        this->dimc_csr_snapshot_apply(pending_insn, dimc_kernel_csr, dimc_feature_reuse_csr,
+            dimc_compute_reuse_csr);
     insn->stub_handler(&this->iss, insn, insn->addr);
+    this->dimc_csr_snapshot_restore(dimc_csr_snapshot_applied, dimc_kernel_csr,
+        dimc_feature_reuse_csr, dimc_compute_reuse_csr);
 
 #ifdef VP_TRACE_ACTIVE
     this->dump_regs_to_trace(insn, pending_insn, nb_elem, true);

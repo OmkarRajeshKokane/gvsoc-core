@@ -189,6 +189,10 @@ void ExecInOrder::exec_instr(vp::Block *__this, vp::ClockEvent *event)
             iss->decode.decode_pc(insn, insn->addr);
         }
 
+#if defined(CONFIG_GVSOC_ISS_USE_SPATZ)
+        iss->arch.vu.vmvm_profile_scalar_instruction(insn, iss->clock.get_cycles());
+#endif
+
         if (iss->regfile.scoreboard_insn_check(insn)) return;
 
         iss->regfile.scoreboard_insn_start(insn);
@@ -311,6 +315,10 @@ void ExecInOrder::exec_instr_check_all(vp::Block *__this, vp::ClockEvent *event)
 
             iss->decode.decode_pc(insn, insn->addr);
         }
+
+#if defined(CONFIG_GVSOC_ISS_USE_SPATZ)
+        iss->arch.vu.vmvm_profile_scalar_instruction(insn, iss->clock.get_cycles());
+#endif
 
         if (iss->regfile.scoreboard_insn_check(insn)) return;
 

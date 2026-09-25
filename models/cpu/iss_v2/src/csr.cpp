@@ -104,6 +104,13 @@ Csr::Csr(Iss &iss)
 #if defined(CONFIG_ISS_HAS_VECTOR)
     this->declare_csr(&this->vlenb,  "vlenb",  0xC22, CONFIG_ISS_VLEN/8);
 #endif
+    this->declare_csr(&this->dimc_kernel, "dimc_kernel", 0x7D3);
+    this->declare_csr(&this->dimc_feature_reuse, "dimc_feature_reuse", 0x7D4);
+    this->declare_csr(&this->dimc_compute_reuse, "dimc_compute_reuse", 0x7D5);
+    this->declare_csr(&this->vmvm_profile_marker, "vmvm_profile_marker", 0x7D6);
+    this->vmvm_profile_marker.register_callback(std::bind(
+        &Csr::vmvm_profile_marker_access, this, std::placeholders::_1,
+        std::placeholders::_2, std::placeholders::_3));
 #if defined(CONFIG_GVSOC_ISS_PMP)
     // Machine protection and translation
     for (int i=0; i<16; i++)
@@ -1538,6 +1545,14 @@ const char *iss_csr_name(Iss *iss, iss_reg_t reg)
     case 0x7b3:
         return "scratch1";
 
+    case 0x7D3:
+        return "dimc_kernel";
+    case 0x7D4:
+        return "dimc_feature_reuse";
+    case 0x7D5:
+        return "dimc_compute_reuse";
+    case 0x7D6:
+        return "vmvm_profile_marker";
     }
 
 #if defined(ISS_HAS_PERF_COUNTERS)
@@ -1663,6 +1678,15 @@ bool CsrAbtractReg::access(iss_insn_t *insn, bool is_write, iss_reg_t &value)
         }
     }
     return false;
+}
+
+bool Csr::vmvm_profile_marker_access(iss_insn_t *insn, bool is_write, iss_reg_t &value)
+{
+    if (is_write)
+    {
+        this->iss.arch.vu.vmvm_profile_marker(value);
+    }
+    return true;
 }
 
 void CsrAbtractReg::register_callback(std::function<bool(iss_insn_t *, bool, iss_reg_t &)> callback)

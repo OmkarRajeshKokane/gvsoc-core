@@ -137,6 +137,12 @@ void VuCompute::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
             int nb_elem_per_cycle = ((nb_units * _this->vu.lane_width /
                 _this->vu.iss.vector.sewb) >> insn->desc->elem_rate_shift)
                 << insn->desc->elem_rate_boost;
+            const bool is_dimc_insn = Vu::is_dimc_insn(insn);
+            if (is_dimc_insn)
+            {
+                nb_elem_per_cycle = _this->vu.iss.csr.vl.value -
+                    _this->vu.iss.csr.vstart.value;
+            }
 
             if (pending_insn->nb_bytes_done == 0)
             {
@@ -169,6 +175,11 @@ void VuCompute::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
             _this->vu.current_insn_reg_2 = pending_insn->reg_2;
 
             _this->vu.insn_latency = 0;
+            if (pending_insn->nb_bytes_done == 0)
+            {
+                pending_insn->exec_start_cycle =
+                    _this->vu.iss.clock.get_cycles();
+            }
             _this->vu.exec_insn_chunk(insn, pending_insn, _this->vstart, _this->vend, nb_elem_per_cycle);
             if (_this->vu.insn_latency > 0)
             {
@@ -183,20 +194,23 @@ void VuCompute::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 
             if (pending_insn->nb_bytes_done >= _this->total_size)
             {
-                // All chunks executed: the instruction completes without
-                // blocking the issue of the next instruction in the block.
-                // The FPU pipeline drain is not added to the scoreboard
-                // release: the release also gates WAW/WAR consumers and the
-                // queue slot retirement, which the RTL frees at commit time
-                // — the drain is only visible to RAW consumers, carried by
-                // the chaining gate through pipeline_latency,
-                // commit_done_cycle and chain_release_cycle.
+                // Account for DIMC data movement before releasing the instruction.
+                int extra_latency = 0;
+                const char *label = insn->desc->label;
+                if (std::strcmp(label, "sf_vqmmacc") == 0 ||
+                    std::strcmp(label, "sf.vqmmacc") == 0 ||
+                    std::strcmp(label, "sf_vqmmacc16") == 0 ||
+                    std::strcmp(label, "sf.vqmmacc16") == 0)
+                {
+                    extra_latency = _this->vu.iss.arch.dimc.Move_delay;
+                }
+
+                // The instruction leaves the issue queue after its last
+                // chunk; completion and scoreboard release happen later.
                 _this->insns.pop();
                 pending_insn->commit_done_cycle = _this->vu.iss.clock.get_cycles();
                 pending_insn->timestamp = _this->vu.iss.clock.get_cycles() +
-                    insn->latency + 1;
-                // The unit keeps draining its pipeline after the last word
-                // entered, which gates datapath switches
+                    insn->latency + 1 + extra_latency;
                 _this->unit_busy_until[unit_class] = pending_insn->commit_done_cycle +
                     pending_insn->pipeline_latency + 3;
                 _this->draining.push_back(pending_insn);

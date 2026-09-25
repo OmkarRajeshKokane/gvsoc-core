@@ -240,6 +240,10 @@ public:
     CsrReg vl;
     CsrReg vtype;
     CsrReg vlenb;
+    CsrReg dimc_kernel;
+    CsrReg dimc_feature_reuse;
+    CsrReg dimc_compute_reuse;
+    CsrReg vmvm_profile_marker;
 
     // Hwloop CSR storage now lives in the Hwloop module (see
     // include/hwloop/hwloop.hpp). The LPSTART / LPEND / LPCOUNT
@@ -263,6 +267,7 @@ private:
     bool tselect_access(iss_insn_t *insn, bool is_write, iss_reg_t &value);
     bool time_access(iss_insn_t *insn, bool is_write, iss_reg_t &value);
     bool mcycle_access(iss_insn_t *insn, bool is_write, iss_reg_t &value);
+    bool vmvm_profile_marker_access(iss_insn_t *insn, bool is_write, iss_reg_t &value);
 
     std::map<iss_reg_t, CsrAbtractReg *> regs;
     vp::WireMaster<uint64_t> time_itf;

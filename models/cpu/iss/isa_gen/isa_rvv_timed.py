@@ -587,6 +587,7 @@ class Rv32v(IsaSubset):
             Instr('vfslide1down.vf' , VF_VFFU, '001111 - ----- ----- 101 ----- 1010111', tags=['fp_op', 'nseq']),
             Instr('vfslide1up.vf'   , VF_VFFU, '001110 - ----- ----- 101 ----- 1010111', tags=['fp_op', 'nseq']),
             Instr('sf_vqmmacc'      , Format_DIMC_sqacc, '101110 - ----- ----- 000 ----- 1110111'),
+            Instr('sf_vqmmacc16'    , Format_DIMC_sqacc, '101110 - ----- ----- 001 ----- 1110111'),
 
 
 

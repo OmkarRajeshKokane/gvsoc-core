@@ -19,10 +19,288 @@
  */
 
  #include <cstdint>
+ #include <algorithm>
+ #include <cstdlib>
  #include <cstring>
  #include <vp/stats/stats_engine.hpp>
  #include <cpu/iss_v2/include/cores/vector_unit/vector_unit.hpp>
 
+ uint64_t sf_vqmmacc_count = 0;
+uint64_t sf_vqmmacc16_count = 0;
+uint64_t vle_count = 0;
+uint64_t vse_count = 0;
+uint64_t other_count = 0;
+
+uint64_t queue_depth_sum = 0;
+uint64_t queue_depth_samples = 0;
+uint64_t queue_depth_max = 0;
+
+uint64_t vu_busy_cycles = 0;
+uint64_t sf_vqmmacc_cycles = 0;
+uint64_t sf_vqmmacc16_cycles = 0;
+uint64_t vle_cycles = 0;
+uint64_t vse_cycles = 0;
+uint64_t other_cycles = 0;
+
+int Vu::vmvm_profile_fixed_priority(iss_insn_t *insn)
+{
+    const char *label = insn->desc->label;
+    if (strcmp(label, "sf_vqmmacc") == 0 || strcmp(label, "sf.vqmmacc") == 0 ||
+        strcmp(label, "sf_vqmmacc16") == 0 || strcmp(label, "sf.vqmmacc16") == 0)
+    {
+        return vmvm_profile_sfvqmmacc;
+    }
+    if (insn->decoder_item->u.insn.tags[ISA_TAG_LOAD_ID] ||
+        insn->decoder_item->u.insn.tags[ISA_TAG_VLOAD_ID])
+    {
+        return vmvm_profile_load;
+    }
+    if (insn->decoder_item->u.insn.tags[ISA_TAG_STORE_ID] ||
+        insn->decoder_item->u.insn.tags[ISA_TAG_VSTORE_ID])
+    {
+        return vmvm_profile_store;
+    }
+    if (strncmp(label, "vfadd", 5) == 0) return vmvm_profile_vfadd;
+    if (strncmp(label, "vsetvli", 8) == 0 || strncmp(label, "vsetivli", 9) == 0)
+        return vmvm_profile_vsetvli;
+    return 0;
+}
+
+void Vu::vmvm_profile_add_named_interval(const char *label, int fixed_priority,
+    uint64_t start, uint64_t end)
+{
+    if (!this->vmvm_profile_active || label == nullptr || end <= start) return;
+
+    if (start < this->vmvm_profile_start_cycle) start = this->vmvm_profile_start_cycle;
+    if (end <= start) return;
+
+    this->vmvm_profile_intervals.push_back({start, end, label, fixed_priority});
+}
+
+void Vu::vmvm_profile_add_interval(iss_insn_t *insn, uint64_t start, uint64_t end)
+{
+    this->vmvm_profile_add_named_interval(insn->desc->label,
+        Vu::vmvm_profile_fixed_priority(insn), start, end);
+}
+
+void Vu::vmvm_profile_scalar_instruction(iss_insn_t *insn, uint64_t cycle)
+{
+    uint64_t pc = insn->addr;
+    if (this->vmvm_profile_active && pc != this->vmvm_boundary_last_scalar_pc &&
+        std::find(this->vmvm_boundary_pcs.begin(), this->vmvm_boundary_pcs.end(), pc) !=
+            this->vmvm_boundary_pcs.end())
+    {
+        this->vmvm_boundary_events.push_back({pc, cycle});
+    }
+    this->vmvm_boundary_last_scalar_pc = pc;
+    this->vmvm_profile_add_interval(insn, cycle, cycle + 1);
+}
+
+void Vu::vmvm_profile_dump(uint64_t end_cycle)
+{
+    struct ProfileEvent
+    {
+        uint64_t cycle;
+        std::string label;
+        int delta;
+    };
+
+    std::vector<ProfileEvent> events;
+    std::map<std::string, uint64_t> raw_cycles;
+    std::map<std::string, int> fixed_priorities;
+    for (const VmvmProfileInterval &interval : this->vmvm_profile_intervals)
+    {
+        uint64_t start = std::max(interval.start, this->vmvm_profile_start_cycle);
+        uint64_t end = std::min(interval.end, end_cycle);
+        if (end > start)
+        {
+            events.push_back({start, interval.label, 1});
+            events.push_back({end, interval.label, -1});
+            raw_cycles[interval.label] += end - start;
+            int &priority = fixed_priorities[interval.label];
+            if (priority == 0 || (interval.fixed_priority != 0 && interval.fixed_priority < priority))
+                priority = interval.fixed_priority;
+        }
+    }
+
+    std::sort(events.begin(), events.end(), [](const ProfileEvent &a, const ProfileEvent &b) {
+        return a.cycle < b.cycle;
+    });
+
+    std::map<std::string, int> active;
+    std::map<std::string, uint64_t> cycles;
+    uint64_t cursor = this->vmvm_profile_start_cycle;
+    size_t event_index = 0;
+
+    auto winner = [&]() -> std::string {
+        std::string best;
+        int best_priority = 0;
+        uint64_t best_raw = 0;
+        for (const auto &entry : active)
+        {
+            if (entry.second <= 0) continue;
+            int priority = fixed_priorities[entry.first];
+            if (priority == 0) priority = vmvm_profile_dma_wait_all + 1;
+            uint64_t raw = raw_cycles[entry.first];
+            if (best.empty() || priority < best_priority ||
+                (priority == best_priority && raw > best_raw) ||
+                (priority == best_priority && raw == best_raw && entry.first < best))
+            {
+                best = entry.first;
+                best_priority = priority;
+                best_raw = raw;
+            }
+        }
+        return best;
+    };
+
+    while (event_index < events.size())
+    {
+        uint64_t event_cycle = events[event_index].cycle;
+        if (event_cycle > cursor)
+        {
+            std::string label = winner();
+            if (label.empty()) label = "pipeline_stall";
+            cycles[label] += event_cycle - cursor;
+            cursor = event_cycle;
+        }
+
+        while (event_index < events.size() && events[event_index].cycle == event_cycle)
+        {
+            active[events[event_index].label] += events[event_index].delta;
+            event_index++;
+        }
+    }
+
+    if (end_cycle > cursor)
+    {
+        std::string label = winner();
+        if (label.empty()) label = "pipeline_stall";
+        cycles[label] += end_cycle - cursor;
+    }
+
+    raw_cycles["pipeline_stall"] += cycles["pipeline_stall"];
+    std::array<uint64_t, 7> grouped_cycles = {};
+    uint64_t additional_cycles = 0;
+    for (const auto &entry : cycles)
+    {
+        int priority = fixed_priorities[entry.first];
+        if (priority >= vmvm_profile_sfvqmmacc && priority <= vmvm_profile_dma_wait_all)
+            grouped_cycles[priority] += entry.second;
+        else if (entry.first != "pipeline_stall")
+            additional_cycles += entry.second;
+    }
+
+    uint64_t total = end_cycle - this->vmvm_profile_start_cycle;
+    printf("VMVM_PROFILE priority_cycles total=%llu sfvqmmacc=%llu load=%llu store=%llu vfadd=%llu vsetvli=%llu dma_wait_all=%llu additional=%llu pipeline_stall=%llu\n",
+        (unsigned long long)total,
+        (unsigned long long)grouped_cycles[vmvm_profile_sfvqmmacc],
+        (unsigned long long)grouped_cycles[vmvm_profile_load],
+        (unsigned long long)grouped_cycles[vmvm_profile_store],
+        (unsigned long long)grouped_cycles[vmvm_profile_vfadd],
+        (unsigned long long)grouped_cycles[vmvm_profile_vsetvli],
+        (unsigned long long)grouped_cycles[vmvm_profile_dma_wait_all],
+        (unsigned long long)additional_cycles,
+        (unsigned long long)cycles["pipeline_stall"]);
+
+    std::vector<std::string> labels;
+    for (const auto &entry : raw_cycles) labels.push_back(entry.first);
+    std::sort(labels.begin(), labels.end(), [&](const std::string &a, const std::string &b) {
+        if (cycles[a] != cycles[b]) return cycles[a] > cycles[b];
+        return a < b;
+    });
+
+    std::vector<std::pair<std::string, uint64_t>> dynamic_labels;
+    for (const auto &entry : raw_cycles)
+        if (fixed_priorities[entry.first] == 0)
+            dynamic_labels.push_back(entry);
+    std::sort(dynamic_labels.begin(), dynamic_labels.end(), [](const auto &a, const auto &b) {
+        if (a.second != b.second) return a.second > b.second;
+        return a.first < b.first;
+    });
+    std::map<std::string, int> dynamic_ranks;
+    for (size_t i = 0; i < dynamic_labels.size(); i++)
+        dynamic_ranks[dynamic_labels[i].first] = vmvm_profile_dma_wait_all + 1 + i;
+
+    for (const std::string &label : labels)
+    {
+        int priority = fixed_priorities[label];
+        if (priority == 0) priority = dynamic_ranks[label];
+        printf("VMVM_PROFILE_INSN name=%s priority=%d raw=%llu cycles=%llu\n",
+            label.c_str(), priority, (unsigned long long)raw_cycles[label],
+            (unsigned long long)cycles[label]);
+    }
+
+    if (!this->vmvm_boundary_pcs.empty())
+    {
+        FILE *boundary_output = stdout;
+        if (!this->vmvm_boundary_output_path.empty())
+        {
+            boundary_output = fopen(this->vmvm_boundary_output_path.c_str(), "a");
+            if (boundary_output == nullptr) boundary_output = stdout;
+        }
+        uint64_t previous_cycle = this->vmvm_profile_start_cycle;
+        fprintf(boundary_output,
+            "VMVM_BOUNDARY_EVENT seq=0 kind=start pc=0x0 cycle=0 delta=0\n");
+        for (size_t i = 0; i < this->vmvm_boundary_events.size(); i++)
+        {
+            const VmvmBoundaryEvent &event = this->vmvm_boundary_events[i];
+            fprintf(boundary_output,
+                "VMVM_BOUNDARY_EVENT seq=%llu kind=pc pc=0x%llx cycle=%llu delta=%llu\n",
+                (unsigned long long)(i + 1), (unsigned long long)event.pc,
+                (unsigned long long)(event.cycle - this->vmvm_profile_start_cycle),
+                (unsigned long long)(event.cycle - previous_cycle));
+            previous_cycle = event.cycle;
+        }
+        fprintf(boundary_output,
+            "VMVM_BOUNDARY_EVENT seq=%llu kind=stop pc=0x0 cycle=%llu delta=%llu\n",
+            (unsigned long long)(this->vmvm_boundary_events.size() + 1),
+            (unsigned long long)(end_cycle - this->vmvm_profile_start_cycle),
+            (unsigned long long)(end_cycle - previous_cycle));
+        if (boundary_output != stdout) fclose(boundary_output);
+    }
+}
+
+void Vu::vmvm_profile_marker(uint64_t marker)
+{
+    uint64_t cycle = this->iss.clock.get_cycles();
+
+    if (marker == 7)
+    {
+        if (!this->vmvm_profile_active)
+        {
+            this->vmvm_profile_active = true;
+            this->vmvm_profile_dma_wait_active = false;
+            this->vmvm_profile_start_cycle = cycle;
+            this->vmvm_profile_intervals.clear();
+            this->vmvm_boundary_events.clear();
+            this->vmvm_boundary_last_scalar_pc = UINT64_MAX;
+        }
+        else if (this->vmvm_profile_dma_wait_active)
+        {
+            this->vmvm_profile_add_named_interval("dma_wait_all", vmvm_profile_dma_wait_all,
+                this->vmvm_profile_dma_wait_start, cycle);
+            this->vmvm_profile_dma_wait_active = false;
+        }
+    }
+    else if (marker == 6 && this->vmvm_profile_active &&
+             !this->vmvm_profile_dma_wait_active)
+    {
+        this->vmvm_profile_dma_wait_start = cycle;
+        this->vmvm_profile_dma_wait_active = true;
+    }
+    else if (marker == 0 && this->vmvm_profile_active)
+    {
+        if (this->vmvm_profile_dma_wait_active)
+        {
+            this->vmvm_profile_add_named_interval("dma_wait_all", vmvm_profile_dma_wait_all,
+                this->vmvm_profile_dma_wait_start, cycle);
+            this->vmvm_profile_dma_wait_active = false;
+        }
+        this->vmvm_profile_dump(cycle);
+        this->vmvm_profile_active = false;
+    }
+}
 
 // Vector registers this instruction reads, as the scoreboard must see them.
 // A masked instruction (vm bit clear) also reads v0, which is implicit in
@@ -48,6 +326,26 @@ Vu::Vu(Iss &iss)
     nb_pending_insn(*this, "nb_pending_insn", 8, true),
     queue_full(*this, "queue_full", 1, true)
 {
+    const char *boundary_pc_spec = std::getenv("VMVM_BOUNDARY_PCS");
+    while (boundary_pc_spec != nullptr && *boundary_pc_spec != '\0')
+    {
+        char *end = nullptr;
+        uint64_t pc = std::strtoull(boundary_pc_spec, &end, 0);
+        if (end == boundary_pc_spec) break;
+        this->vmvm_boundary_pcs.push_back(pc);
+        boundary_pc_spec = end;
+        while (*boundary_pc_spec == ',' || *boundary_pc_spec == ' ' ||
+               *boundary_pc_spec == '\t')
+        {
+            boundary_pc_spec++;
+        }
+    }
+    const char *boundary_output_path = std::getenv("VMVM_BOUNDARY_OUT");
+    if (boundary_output_path != nullptr)
+    {
+        this->vmvm_boundary_output_path = boundary_output_path;
+    }
+
     this->traces.new_trace("trace", &this->trace, vp::DEBUG);
     this->traces.new_trace_event("active", &this->event_active, 1);
     this->traces.new_trace_event_string("label", &this->event_label);
@@ -123,6 +421,7 @@ iss_reg_t Vu::load_store_handler(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 
 void Vu::reset(bool active)
 {
+
     if (active)
     {
         this->nb_pending_vaccess = 0;
@@ -137,6 +436,40 @@ void Vu::reset(bool active)
             pending_insn.id = index++;
         }
     }
+}
+
+bool Vu::is_dimc_insn(iss_insn_t *insn)
+{
+    return strcmp(insn->desc->label, "sf_vqmmacc") == 0 ||
+        strcmp(insn->desc->label, "sf.vqmmacc") == 0 ||
+        strcmp(insn->desc->label, "sf_vqmmacc16") == 0 ||
+        strcmp(insn->desc->label, "sf.vqmmacc16") == 0;
+}
+
+uint32_t Vu::input_vreg_mask(iss_insn_t *insn, PendingInsn *pending_insn)
+{
+    uint32_t mask = insn->sb_in_vreg_mask;
+
+    if (!Vu::is_dimc_insn(insn))
+    {
+        return mask;
+    }
+
+    if (pending_insn->dimc_feature_reuse_csr != 0)
+    {
+        mask = 0;
+    }
+
+    if (pending_insn->dimc_kernel_csr != 0)
+    {
+        int kernel_base = insn->uim[1] * 8;
+        for (int id = kernel_base; id < kernel_base + 8; id++)
+        {
+            mask |= 1u << id;
+        }
+    }
+
+    return mask;
 }
 
 PendingInsn *Vu::pending_insn_alloc(InsnEntry *entry)
@@ -155,30 +488,97 @@ PendingInsn *Vu::pending_insn_alloc(InsnEntry *entry)
     pending_insn->valid = true;
     pending_insn->entry = entry;
     pending_insn->nb_bytes_done = 0;
+    pending_insn->exec_start_cycle = 0;
+    pending_insn->has_dimc_csr_snapshot = false;
 
     iss_insn_t *insn = this->iss.exec.get_insn(entry);
     // Chaining is controlled per instruction through the chaining factors:
     // the RTL prevents chaining only for the slide-up family and the
     // strided/indexed memory accesses (their factors are set to 0 by the
     // ISA setup); slide-down and vmv chain like any other instruction.
-    pending_insn->in_can_be_chained = insn->desc->chaining_factor != 0.0f;
-    pending_insn->out_can_be_chained = insn->desc->out_chaining_factor != 0.0f;
+    const bool is_dimc = Vu::is_dimc_insn(insn);
+    pending_insn->in_can_be_chained = !is_dimc &&
+        insn->desc->chaining_factor != 0.0f;
+    pending_insn->out_can_be_chained = !is_dimc &&
+        insn->desc->out_chaining_factor != 0.0f;
+    if (is_dimc)
+    {
+        pending_insn->has_dimc_csr_snapshot = true;
+        pending_insn->dimc_kernel_csr = this->iss.csr.dimc_kernel.value;
+        pending_insn->dimc_feature_reuse_csr = this->iss.csr.dimc_feature_reuse.value;
+        pending_insn->dimc_compute_reuse_csr = this->iss.csr.dimc_compute_reuse.value;
+    }
 
     return pending_insn;
 }
 
+bool Vu::dimc_csr_snapshot_apply(PendingInsn *pending_insn, uint64_t &dimc_kernel_csr,
+    uint64_t &dimc_feature_reuse_csr, uint64_t &dimc_compute_reuse_csr)
+{
+    if (!pending_insn->has_dimc_csr_snapshot)
+    {
+        return false;
+    }
+
+    dimc_kernel_csr = this->iss.csr.dimc_kernel.value;
+    dimc_feature_reuse_csr = this->iss.csr.dimc_feature_reuse.value;
+    dimc_compute_reuse_csr = this->iss.csr.dimc_compute_reuse.value;
+    this->iss.csr.dimc_kernel.value = pending_insn->dimc_kernel_csr;
+    this->iss.csr.dimc_feature_reuse.value = pending_insn->dimc_feature_reuse_csr;
+    this->iss.csr.dimc_compute_reuse.value = pending_insn->dimc_compute_reuse_csr;
+    return true;
+}
+
+void Vu::dimc_csr_snapshot_restore(bool applied, uint64_t dimc_kernel_csr,
+    uint64_t dimc_feature_reuse_csr, uint64_t dimc_compute_reuse_csr)
+{
+    if (!applied)
+    {
+        return;
+    }
+
+    this->iss.csr.dimc_kernel.value = dimc_kernel_csr;
+    this->iss.csr.dimc_feature_reuse.value = dimc_feature_reuse_csr;
+    this->iss.csr.dimc_compute_reuse.value = dimc_compute_reuse_csr;
+}
+
 void Vu::insn_enqueue(InsnEntry *entry)
 {
+    this->profile_dumped = false;
     PendingInsn *pending_insn = this->pending_insn_alloc(entry);
     this->trace.msg(vp::Trace::LEVEL_TRACE, "Enqueue instruction (pc: 0x%lx, id: %d)\n",
         entry->addr, pending_insn->id);
 
 	iss_insn_t *insn = this->iss.exec.get_insn(pending_insn->entry);
 
+const char *label =    insn->desc->label;
     uint8_t one = 1;
     this->event_active.event(&one);
     this->event_queue.event((uint8_t *)&insn->addr);
     this->event_label.event_string(insn->desc->label, false);
+
+    if (strcmp(label, "sf_vqmmacc") == 0 ||
+    strcmp(label, "sf.vqmmacc") == 0)
+{
+    sf_vqmmacc_count++;
+}
+else if (strcmp(label, "sf_vqmmacc16") == 0 ||
+         strcmp(label, "sf.vqmmacc16") == 0)
+{
+    sf_vqmmacc16_count++;
+}
+else if (strncmp(label, "vle", 3) == 0)
+{
+    vle_count++;
+}
+else if (strncmp(label, "vse", 3) == 0)
+{
+    vse_count++;
+}
+else
+{
+    other_count++;
+}
 
     pending_insn->chaining_factor = insn->desc->chaining_factor;
     pending_insn->out_chaining_factor = insn->desc->out_chaining_factor;
@@ -346,6 +746,34 @@ void Vu::insn_commit(PendingInsn *pending_insn, int size)
 void Vu::insn_end(PendingInsn *pending_insn)
 {
     iss_insn_t *insn = this->iss.exec.get_insn(pending_insn->entry);
+uint64_t latency = pending_insn->exec_start_cycle >= 0 ?
+    this->iss.clock.get_cycles() - pending_insn->exec_start_cycle : 0;
+
+const char *label = insn->desc->label;
+if (strcmp(label, "sf_vqmmacc") == 0 ||
+    strcmp(label, "sf.vqmmacc") == 0)
+{
+    sf_vqmmacc_cycles += latency;
+}
+else if (strcmp(label, "sf_vqmmacc16") == 0 ||
+         strcmp(label, "sf.vqmmacc16") == 0)
+{
+    sf_vqmmacc16_cycles += latency;
+}
+else if (strncmp(label, "vle", 3) == 0)
+{
+    vle_cycles += latency;
+}
+else if (strncmp(label, "vse", 3) == 0)
+{
+    vse_cycles += latency;
+}
+
+if (pending_insn->exec_start_cycle >= 0)
+{
+    this->vmvm_profile_add_interval(insn,
+        pending_insn->exec_start_cycle, this->iss.clock.get_cycles());
+}
 
     this->trace.msg(vp::Trace::LEVEL_TRACE, "End of instruction (pc: 0x%lx, id: %d)\n",
         insn->addr, pending_insn->id);
@@ -450,10 +878,17 @@ void Vu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 
     if (_this->nb_pending_insn.get() == 0)
     {
+        if (!_this->profile_dumped)
+        {
+            _this->profile_dumped = true;
+
+        }
+
         _this->event_queue.event_highz();
         _this->event_pc.event_highz();
         _this->fsm_event.disable();
     }
+   // _this->dump_profile();
 }
 
 void Vu::isa_init()
@@ -723,4 +1158,52 @@ iss_reg_t Vu::vector_insn_stub_handler(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
     iss->arch.vu.insn_enqueue(entry);
 
     return iss_insn_next(iss, insn, pc);
+}
+void Vu::dump_profile()
+{
+    printf("\nVU PROFILE\n");
+
+    printf("Instruction counts:\n");
+    printf("  sf_vqmmacc     %lu\n", sf_vqmmacc_count);
+    printf("  sf_vqmmacc16   %lu\n", sf_vqmmacc16_count);
+    printf("  vle*           %lu\n", vle_count);
+    printf("  vse*           %lu\n", vse_count);
+    printf("  other          %lu\n", other_count);
+
+    printf("\nQueue:\n");
+    printf("  avg_depth      %.2f\n",
+        queue_depth_samples ?
+        (double)queue_depth_sum / queue_depth_samples : 0.0);
+
+    printf("  max_depth      %lu\n",
+        queue_depth_max);
+
+    printf("\nExecution:\n");
+    printf("  busy_cycles    %lu\n",
+        vu_busy_cycles);
+        printf("\nCycles:\n");
+
+printf("  sf_vqmmacc     %lu total  %.2f avg\n",
+    sf_vqmmacc_cycles,
+    sf_vqmmacc_count ?
+    (double)sf_vqmmacc_cycles /
+    sf_vqmmacc_count : 0.0);
+
+printf("  sf_vqmmacc16     %lu total  %.2f avg\n",
+    sf_vqmmacc16_cycles,
+    sf_vqmmacc16_count ?
+    (double)sf_vqmmacc16_cycles /
+    sf_vqmmacc16_count : 0.0);
+
+printf("  vle*           %lu total  %.2f avg\n",
+    vle_cycles,
+    vle_count ?
+    (double)vle_cycles /
+    vle_count : 0.0);
+
+printf("  vse*           %lu total  %.2f avg\n",
+    vse_cycles,
+    vse_count ?
+    (double)vse_cycles /
+    vse_count : 0.0);
 }
